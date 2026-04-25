@@ -27,7 +27,9 @@ Real-time options data requires Polygon permissions that may need a paid plan.
 streamlit run app.py
 ```
 
-The dashboard opens in your browser. It can scan a selected S&P 500 batch manually, and it can auto-refresh every 5 minutes during regular US market hours.
+The dashboard opens in your browser. It can scan a selected S&P 500 batch manually, and it can auto-refresh during regular US market hours.
+
+The auto-refresh interval is configurable from the sidebar. Enable **Auto-refresh during market hours**, then choose seconds or minutes and set the interval, such as 15 minutes for delayed data or 1 minute for a more frequent scan cadence.
 
 ## Test
 

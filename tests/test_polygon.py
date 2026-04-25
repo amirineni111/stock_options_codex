@@ -1,3 +1,6 @@
+import httpx
+import pytest
+
 from options_screening.polygon import PolygonClient
 
 
@@ -25,3 +28,41 @@ def test_parse_polygon_chain_snapshot():
     assert contract.mid_price == 2.5
     assert contract.spread_pct == 8.0
     assert contract.delta == 0.41
+
+
+def test_polygon_http_errors_redact_api_key(monkeypatch):
+    api_key = "secret-polygon-key"
+
+    class FakeResponse:
+        status_code = 403
+
+        def raise_for_status(self):
+            request = httpx.Request(
+                "GET",
+                f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/AAPL?apiKey={api_key}",
+            )
+            response = httpx.Response(403, request=request)
+            raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def get(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+
+    client = PolygonClient(api_key)
+    with pytest.raises(RuntimeError) as exc_info:
+        client.get_stock_price("AAPL")
+
+    message = str(exc_info.value)
+    assert api_key not in message
+    assert "apiKey=REDACTED" in message

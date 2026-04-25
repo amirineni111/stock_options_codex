@@ -19,13 +19,18 @@ class PolygonClient:
         query = dict(params or {})
         query["apiKey"] = self.api_key
         url = f"{self.base_url}{path}"
+        safe_query = dict(query)
+        safe_query["apiKey"] = "REDACTED"
+        safe_url = str(httpx.URL(url, params=safe_query))
         with httpx.Client(timeout=self.timeout_seconds) as client:
-            response = client.get(url, params=query)
+            try:
+                response = client.get(url, params=query)
+            except httpx.RequestError as exc:
+                raise RuntimeError(f"Polygon API request failed for {safe_url}: {exc.__class__.__name__}") from None
             try:
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
-                safe_url = str(exc.request.url).replace(self.api_key, "REDACTED")
-                raise RuntimeError(f"Polygon API error {exc.response.status_code} for {safe_url}") from exc
+                raise RuntimeError(f"Polygon API error {exc.response.status_code} for {safe_url}") from None
             return response.json()
 
     def get_option_chain_snapshots(

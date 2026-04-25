@@ -6,6 +6,7 @@ from streamlit_autorefresh import st_autorefresh
 
 from options_screening.config import get_settings
 from options_screening.market_hours import is_regular_market_hours
+from options_screening.refresh import format_refresh_interval, refresh_interval_to_ms
 from options_screening.scanner import ScanRequest, run_scan
 from options_screening.storage import Storage
 from options_screening.universe import load_sp500_tickers
@@ -21,6 +22,8 @@ def _init_state() -> None:
         st.session_state.auto_refresh = False
     if "last_auto_refresh_count" not in st.session_state:
         st.session_state.last_auto_refresh_count = None
+    if "last_auto_refresh_key" not in st.session_state:
+        st.session_state.last_auto_refresh_key = None
 
 
 def _render_metric_row(df: pd.DataFrame) -> None:
@@ -89,7 +92,24 @@ def main() -> None:
         min_iv, max_iv = st.slider("Implied volatility range", 0.01, 3.0, (0.05, 1.2), 0.01)
         max_contracts = st.number_input("Max contracts per ticker", min_value=5, max_value=250, value=50, step=5)
         ticker_limit = st.number_input("Ticker scan limit", min_value=1, max_value=503, value=50, step=5)
-        st.session_state.auto_refresh = st.checkbox("Auto-refresh every 5 minutes during market hours", value=False)
+        st.subheader("Auto Refresh")
+        st.session_state.auto_refresh = st.checkbox("Auto-refresh during market hours", value=st.session_state.auto_refresh)
+        refresh_unit = st.selectbox("Refresh unit", ["minutes", "seconds"], index=0)
+        default_interval = 15 if refresh_unit == "minutes" else 60
+        max_interval = 1440 if refresh_unit == "minutes" else 86400
+        refresh_interval = st.number_input(
+            "Refresh every",
+            min_value=1,
+            max_value=max_interval,
+            value=default_interval,
+            step=1,
+            disabled=not st.session_state.auto_refresh,
+        )
+        refresh_interval_ms = refresh_interval_to_ms(float(refresh_interval), refresh_unit)
+        refresh_label = format_refresh_interval(float(refresh_interval), refresh_unit)
+        if st.session_state.auto_refresh and refresh_interval_ms < 60 * 1000:
+            st.warning("Very short refresh intervals can quickly consume API quota.")
+        st.caption("Shorter refreshes rerun the dashboard more often; they do not make delayed market data real-time.")
 
     tickers, universe_note = load_sp500_tickers()
     if universe_note:
@@ -120,13 +140,17 @@ def main() -> None:
     with run_col:
         run_now = st.button("Run Scan", type="primary", disabled=not bool(settings.polygon_api_key))
     with info_col:
-        st.write(f"Universe: S&P 500 first {len(selected_tickers)} tickers. Refresh target: 5 minutes during market hours.")
+        st.write(f"Universe: S&P 500 first {len(selected_tickers)} tickers. Refresh target: {refresh_label} during market hours.")
 
     auto_count = None
     if st.session_state.auto_refresh:
-        auto_count = st_autorefresh(interval=5 * 60 * 1000, key="auto_refresh_counter")
+        auto_refresh_key = f"auto_refresh_counter_{refresh_interval_ms}"
+        if st.session_state.last_auto_refresh_key != auto_refresh_key:
+            st.session_state.last_auto_refresh_count = None
+            st.session_state.last_auto_refresh_key = auto_refresh_key
+        auto_count = st_autorefresh(interval=refresh_interval_ms, key=auto_refresh_key)
         if not is_regular_market_hours():
-            st.info("Auto-refresh is enabled and waiting for regular US market hours.")
+            st.info(f"Auto-refresh is enabled every {refresh_label} and waiting for regular US market hours.")
 
     auto_due = (
         st.session_state.auto_refresh
@@ -175,8 +199,15 @@ def main() -> None:
         st.dataframe(logs, use_container_width=True, hide_index=True)
 
     with tabs[5]:
-        st.json(scan_request.model_dump())
-        st.caption("These settings are used for the next manual scan. Auto-refresh support is displayed here as a v1 control; keep Streamlit open during market hours.")
+        st.json(
+            {
+                **scan_request.model_dump(),
+                "auto_refresh_enabled": st.session_state.auto_refresh,
+                "refresh_interval": refresh_label,
+                "refresh_interval_ms": refresh_interval_ms,
+            }
+        )
+        st.caption("These settings are used for the next manual or auto-refresh scan. Keep Streamlit open during market hours.")
 
 
 if __name__ == "__main__":
