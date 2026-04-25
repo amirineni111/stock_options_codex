@@ -1,0 +1,12 @@
+To run and activate the stremlit app for options data
+
+cd C:\Users\sreea\OneDrive\Desktop\stock_options_codex
+. .\.venv\Scripts\Activate.ps1
+streamlit run app.py
+
+-- to stop streamlit process
+Stop-Process -Name streamlit
+
+--to browse app in browser
+
+http://localhost:8501
