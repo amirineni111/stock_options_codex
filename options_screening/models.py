@@ -45,6 +45,31 @@ class ScoredContract(BaseModel):
     premium_at_risk: float
     breakeven: float
     reason: str
+    underlying_last_price: Optional[float] = None
+    sma20: Optional[float] = None
+    sma50: Optional[float] = None
+    trend_signal: Optional[str] = None
+    trend_aligned: Optional[bool] = None
+    earnings_date: Optional[date] = None
+    earnings_warning: Optional[str] = None
+    breakeven_distance_pct: Optional[float] = None
+    expected_move_pct: Optional[float] = None
+    expected_move_to_breakeven_ok: Optional[bool] = None
+    favorable_2pct_value: Optional[float] = None
+    favorable_2pct_pnl: Optional[float] = None
+    adverse_2pct_value: Optional[float] = None
+    adverse_2pct_pnl: Optional[float] = None
+    decision_checklist: Optional[str] = None
+
+
+class MarketContext(BaseModel):
+    underlying: str
+    last_price: Optional[float] = None
+    sma20: Optional[float] = None
+    sma50: Optional[float] = None
+    trend_signal: str = "unknown"
+    earnings_date: Optional[date] = None
+    earnings_warning: Optional[str] = None
 
 
 class RejectedContract(BaseModel):

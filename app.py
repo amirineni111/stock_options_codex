@@ -33,10 +33,56 @@ DEFAULT_PREFERENCES = {
     "implied_volatility_range": [0.05, 1.2],
     "max_contracts_per_ticker": 50,
     "ticker_limit": 50,
+    "use_trend_context": True,
+    "require_trend_alignment": False,
+    "check_earnings": False,
+    "avoid_earnings_before_expiration": False,
     "auto_refresh_enabled": False,
     "refresh_unit": "minutes",
     "refresh_interval": 15,
 }
+RESULT_COLUMN_GUIDE = [
+    ("rank", "Position after sorting by total score. 1 is the highest-ranked contract in the latest scan.", "1"),
+    ("underlying", "Stock or ETF ticker that the option is based on.", "PEP"),
+    ("contract_type", "Call is bullish exposure; put is bearish exposure.", "call"),
+    ("contract_ticker", "Full option contract symbol from Polygon/OCC.", "O:PEP260618C00155000"),
+    ("expiration_date", "Date the option expires. After this date, time value is gone.", "2026-06-18"),
+    ("strike_price", "Price where the option starts to have intrinsic value at expiration.", "155.00"),
+    ("last_price", "Most recent reported option price per share. One contract is this value times 100.", "5.45 = about $545"),
+    ("mid_price", "Estimated fair quote midpoint. Uses bid/ask midpoint when available, otherwise last price.", "5.45"),
+    ("spread_pct", "Bid-ask spread as a percent of mid price. Lower is better; blank means bid/ask was unavailable.", "8.0%"),
+    ("delta", "Approximate option price move for a $1 move in the underlying. Calls are positive; puts are negative.", "0.54"),
+    ("implied_volatility", "Market-implied expected volatility. Higher IV usually means more expensive option premium.", "0.22 = 22%"),
+    ("open_interest", "Number of existing open contracts. Higher usually means better liquidity.", "2,570"),
+    ("volume", "Contracts traded today. Higher usually means more active trading.", "44"),
+    ("days_to_expiration", "Calendar days left until expiration.", "52"),
+    ("max_contracts_by_risk", "How many contracts fit inside your fixed-dollar max risk setting.", "1"),
+    ("premium_at_risk", "Estimated dollars at risk for max_contracts_by_risk contracts.", "545.00"),
+    ("breakeven", "Expiration breakeven. Calls: strike + premium. Puts: strike - premium.", "160.45"),
+    ("underlying_last_price", "Latest underlying stock price used for trend and scenario checks.", "154.20"),
+    ("sma20", "20-day simple moving average of the underlying stock.", "151.80"),
+    ("sma50", "50-day simple moving average of the underlying stock.", "148.40"),
+    ("trend_signal", "Bullish when price is above SMA20 and SMA20 is above SMA50; bearish is the reverse.", "bullish"),
+    ("trend_aligned", "True when calls are in a bullish trend or puts are in a bearish trend.", "True"),
+    ("earnings_date", "Next earnings date found before the max expiration window, if earnings check is enabled.", "2026-05-01"),
+    ("earnings_warning", "Earnings status. Earnings before expiration can add event risk and IV crush risk.", "before expiration"),
+    ("breakeven_distance_pct", "How far the underlying must move to reach expiration breakeven.", "4.05%"),
+    ("expected_move_pct", "Rough expected move to expiration from IV: IV x square root of DTE/365.", "8.20%"),
+    ("expected_move_to_breakeven_ok", "True when expiration breakeven is within the rough IV expected move.", "True"),
+    ("favorable_2pct_value", "Estimated total value if the underlying moves 2% in the favorable direction today.", "652.00"),
+    ("favorable_2pct_pnl", "Estimated profit/loss for that favorable 2% move, using max_contracts_by_risk.", "107.00"),
+    ("adverse_2pct_value", "Estimated total value if the underlying moves 2% against the trade today.", "440.00"),
+    ("adverse_2pct_pnl", "Estimated profit/loss for that adverse 2% move, using max_contracts_by_risk.", "-105.00"),
+    ("decision_checklist", "Plain-English checklist summarizing trend, spread, expected move, and earnings risk.", "trend ok; verify bid/ask"),
+    ("score", "Total ranking score from liquidity, spread, delta, expiration, and IV components. Higher ranks first.", "69.26"),
+    ("score_liquidity", "Score from volume and open interest. Max is 25.", "25.00"),
+    ("score_spread", "Score from tight bid-ask spread. Max is 25; missing bid/ask gets 0.", "0.00"),
+    ("score_delta", "Score for delta being near the center of your selected delta range. Max is 20.", "19.49"),
+    ("score_expiration", "Score for DTE being near the center of your selected expiration range. Max is 15.", "10.62"),
+    ("score_iv", "Score for IV within your selected IV range. Lower IV in range scores better. Max is 15.", "14.15"),
+    ("reason", "Why the contract was accepted, including warnings such as missing bid/ask spread.", "Accepted...verify quote"),
+    ("as_of", "When the option snapshot was parsed, shown in Eastern Time.", "2026-04-27 10:22:26 EDT"),
+]
 
 
 def _init_state(preferences: dict) -> None:
@@ -79,6 +125,21 @@ def _format_results(df: pd.DataFrame) -> pd.DataFrame:
         "max_contracts_by_risk",
         "premium_at_risk",
         "breakeven",
+        "decision_checklist",
+        "trend_signal",
+        "trend_aligned",
+        "underlying_last_price",
+        "sma20",
+        "sma50",
+        "earnings_date",
+        "earnings_warning",
+        "breakeven_distance_pct",
+        "expected_move_pct",
+        "expected_move_to_breakeven_ok",
+        "favorable_2pct_value",
+        "favorable_2pct_pnl",
+        "adverse_2pct_value",
+        "adverse_2pct_pnl",
         "score",
         "score_liquidity",
         "score_spread",
@@ -90,6 +151,75 @@ def _format_results(df: pd.DataFrame) -> pd.DataFrame:
     ]
     available = [col for col in columns if col in df.columns]
     return df[available].copy()
+
+
+def _result_column_config() -> dict:
+    return {
+        column: st.column_config.Column(label=column, help=f"{meaning} Example: {example}")
+        for column, meaning, example in RESULT_COLUMN_GUIDE
+    }
+
+
+def _render_result_column_guide() -> None:
+    guide = pd.DataFrame(
+        [{"Column": column, "Meaning": meaning, "Example": example} for column, meaning, example in RESULT_COLUMN_GUIDE]
+    )
+    with st.expander("Column guide and examples"):
+        st.dataframe(guide, use_container_width=True, hide_index=True)
+
+
+def _render_results_table(df: pd.DataFrame) -> None:
+    _render_result_column_guide()
+    st.dataframe(
+        _format_results(df),
+        use_container_width=True,
+        hide_index=True,
+        column_config=_result_column_config(),
+    )
+
+
+def _render_watchlist(storage: Storage, latest: pd.DataFrame) -> None:
+    st.subheader("Watchlist")
+    watchlist = storage.load_watchlist()
+    if latest.empty:
+        st.info("Run a scan first, then add contracts to the watchlist.")
+    else:
+        formatted = _format_results(latest)
+        choices = formatted["contract_ticker"].dropna().tolist()
+        with st.form("add_watch_contract"):
+            selected_contract = st.selectbox("Contract", choices)
+            selected_row = formatted[formatted["contract_ticker"] == selected_contract].iloc[0]
+            col1, col2, col3 = st.columns(3)
+            entry_price = col1.number_input("Entry price", min_value=0.0, value=float(selected_row.get("mid_price") or 0.0), step=0.01)
+            target_price = col2.number_input("Target price", min_value=0.0, value=0.0, step=0.01)
+            stop_price = col3.number_input("Stop price", min_value=0.0, value=0.0, step=0.01)
+            notes = st.text_area("Notes")
+            submitted = st.form_submit_button("Add to Watchlist")
+            if submitted:
+                storage.add_watch_contract(
+                    contract_ticker=selected_contract,
+                    underlying=selected_row.get("underlying"),
+                    contract_type=selected_row.get("contract_type"),
+                    entry_price=float(entry_price) if entry_price else None,
+                    target_price=float(target_price) if target_price else None,
+                    stop_price=float(stop_price) if stop_price else None,
+                    notes=notes,
+                )
+                st.success("Added to watchlist.")
+                st.rerun()
+
+    if watchlist.empty:
+        st.dataframe(watchlist, use_container_width=True, hide_index=True)
+        return
+
+    st.dataframe(watchlist, use_container_width=True, hide_index=True)
+    open_ids = watchlist[watchlist["status"] == "watching"]["id"].tolist()
+    if open_ids:
+        close_id = st.selectbox("Close watch item", open_ids)
+        if st.button("Mark Closed"):
+            storage.close_watch_contract(int(close_id))
+            st.success("Watch item closed.")
+            st.rerun()
 
 
 def _format_eastern_time(value) -> str:
@@ -194,6 +324,21 @@ def main() -> None:
         min_iv, max_iv = st.slider("Implied volatility range", 0.01, 3.0, _bounded_range(preferences["implied_volatility_range"], 0.01, 3.0, (0.05, 1.2)), 0.01)
         max_contracts = st.number_input("Max contracts per ticker", min_value=5, max_value=250, value=_bounded_number(preferences["max_contracts_per_ticker"], 5, 250, 50), step=5)
         ticker_limit = st.number_input("Ticker scan limit", min_value=1, max_value=503, value=_bounded_number(preferences["ticker_limit"], 1, 503, 50), step=5)
+        st.subheader("Decision Checks")
+        use_trend_context = st.checkbox("Add stock trend context", value=bool(preferences["use_trend_context"]))
+        require_trend_alignment = st.checkbox(
+            "Require trend alignment",
+            value=bool(preferences["require_trend_alignment"]),
+            disabled=not use_trend_context,
+        )
+        check_earnings = st.checkbox("Check earnings dates", value=bool(preferences["check_earnings"]))
+        avoid_earnings_before_expiration = st.checkbox(
+            "Reject earnings before expiration",
+            value=bool(preferences["avoid_earnings_before_expiration"]),
+            disabled=not check_earnings,
+        )
+        if check_earnings:
+            st.warning("Earnings checks add Polygon API calls and may require Benzinga earnings access.")
         st.subheader("Auto Refresh")
         st.session_state.auto_refresh = st.checkbox("Auto-refresh during market hours", value=st.session_state.auto_refresh)
         refresh_options = ["minutes", "seconds"]
@@ -231,6 +376,10 @@ def main() -> None:
                 "implied_volatility_range": [float(min_iv), float(max_iv)],
                 "max_contracts_per_ticker": int(max_contracts),
                 "ticker_limit": int(ticker_limit),
+                "use_trend_context": bool(use_trend_context),
+                "require_trend_alignment": bool(require_trend_alignment and use_trend_context),
+                "check_earnings": bool(check_earnings),
+                "avoid_earnings_before_expiration": bool(avoid_earnings_before_expiration and check_earnings),
                 "auto_refresh_enabled": bool(st.session_state.auto_refresh),
                 "refresh_unit": refresh_unit,
                 "refresh_interval": int(refresh_interval),
@@ -247,7 +396,7 @@ def main() -> None:
     if not settings.polygon_api_key:
         st.error("Add POLYGON_API_KEY to .env, then restart Streamlit or rerun the app.")
 
-    tabs = st.tabs(["Ranked Calls", "Ranked Puts", "Ticker Detail", "Rejected", "Scan Logs", "Settings"])
+    tabs = st.tabs(["Ranked Calls", "Ranked Puts", "Ticker Detail", "Rejected", "Scan Logs", "Watchlist", "Settings"])
 
     scan_request = ScanRequest(
         tickers=selected_tickers,
@@ -263,6 +412,10 @@ def main() -> None:
         max_iv=float(max_iv),
         max_contracts_per_ticker=int(max_contracts),
         allow_missing_spread=bool(allow_missing_spread),
+        use_trend_context=bool(use_trend_context),
+        require_trend_alignment=bool(require_trend_alignment and use_trend_context),
+        check_earnings=bool(check_earnings),
+        avoid_earnings_before_expiration=bool(avoid_earnings_before_expiration and check_earnings),
     )
 
     run_col, info_col = st.columns([1, 4])
@@ -313,20 +466,20 @@ def main() -> None:
 
     with tabs[0]:
         _render_metric_row(calls)
-        st.dataframe(_format_results(calls), use_container_width=True, hide_index=True)
+        _render_results_table(calls)
         if not calls.empty:
             st.download_button("Export Calls CSV", calls.to_csv(index=False), "ranked_calls.csv", "text/csv")
 
     with tabs[1]:
         _render_metric_row(puts)
-        st.dataframe(_format_results(puts), use_container_width=True, hide_index=True)
+        _render_results_table(puts)
         if not puts.empty:
             st.download_button("Export Puts CSV", puts.to_csv(index=False), "ranked_puts.csv", "text/csv")
 
     with tabs[2]:
         ticker = st.selectbox("Ticker", selected_tickers)
         detail = latest[latest["underlying"] == ticker].copy() if not latest.empty else latest
-        st.dataframe(_format_results(detail), use_container_width=True, hide_index=True)
+        _render_results_table(detail)
 
     with tabs[3]:
         st.dataframe(rejected, use_container_width=True, hide_index=True)
@@ -335,6 +488,9 @@ def main() -> None:
         st.dataframe(logs, use_container_width=True, hide_index=True)
 
     with tabs[5]:
+        _render_watchlist(storage, latest)
+
+    with tabs[6]:
         st.json(
             {
                 **scan_request.model_dump(),

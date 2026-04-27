@@ -9,6 +9,23 @@ from .models import RejectedContract, ScoredContract
 
 SQLITE_TIMEOUT_SECONDS = 30.0
 SQLITE_BUSY_TIMEOUT_MS = 30000
+SCAN_RESULT_EXTRA_COLUMNS = {
+    "underlying_last_price": "REAL",
+    "sma20": "REAL",
+    "sma50": "REAL",
+    "trend_signal": "TEXT",
+    "trend_aligned": "INTEGER",
+    "earnings_date": "TEXT",
+    "earnings_warning": "TEXT",
+    "breakeven_distance_pct": "REAL",
+    "expected_move_pct": "REAL",
+    "expected_move_to_breakeven_ok": "INTEGER",
+    "favorable_2pct_value": "REAL",
+    "favorable_2pct_pnl": "REAL",
+    "adverse_2pct_value": "REAL",
+    "adverse_2pct_pnl": "REAL",
+    "decision_checklist": "TEXT",
+}
 
 
 class Storage:
@@ -62,6 +79,21 @@ class Storage:
                     score_delta REAL,
                     score_expiration REAL,
                     score_iv REAL,
+                    underlying_last_price REAL,
+                    sma20 REAL,
+                    sma50 REAL,
+                    trend_signal TEXT,
+                    trend_aligned INTEGER,
+                    earnings_date TEXT,
+                    earnings_warning TEXT,
+                    breakeven_distance_pct REAL,
+                    expected_move_pct REAL,
+                    expected_move_to_breakeven_ok INTEGER,
+                    favorable_2pct_value REAL,
+                    favorable_2pct_pnl REAL,
+                    adverse_2pct_value REAL,
+                    adverse_2pct_pnl REAL,
+                    decision_checklist TEXT,
                     reason TEXT,
                     as_of TEXT
                 );
@@ -83,8 +115,22 @@ class Storage:
                     error TEXT,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS watched_contracts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contract_ticker TEXT NOT NULL,
+                    underlying TEXT,
+                    contract_type TEXT,
+                    entry_price REAL,
+                    target_price REAL,
+                    stop_price REAL,
+                    notes TEXT,
+                    status TEXT DEFAULT 'watching',
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    closed_at TEXT
+                );
                 """
             )
+            self._ensure_columns(conn, "scan_results", SCAN_RESULT_EXTRA_COLUMNS)
 
     def start_scan(self, request: Dict) -> int:
         with self._connect() as conn:
@@ -137,6 +183,21 @@ class Storage:
                     result.score_components.get("delta"),
                     result.score_components.get("expiration"),
                     result.score_components.get("iv"),
+                    result.underlying_last_price,
+                    result.sma20,
+                    result.sma50,
+                    result.trend_signal,
+                    _bool_to_int(result.trend_aligned),
+                    result.earnings_date.isoformat() if result.earnings_date else None,
+                    result.earnings_warning,
+                    result.breakeven_distance_pct,
+                    result.expected_move_pct,
+                    _bool_to_int(result.expected_move_to_breakeven_ok),
+                    result.favorable_2pct_value,
+                    result.favorable_2pct_pnl,
+                    result.adverse_2pct_value,
+                    result.adverse_2pct_pnl,
+                    result.decision_checklist,
                     result.reason,
                     c.as_of.isoformat(),
                 )
@@ -152,8 +213,11 @@ class Storage:
                     theta, vega, implied_volatility, open_interest, volume, underlying_price,
                     days_to_expiration, max_contracts_by_risk, premium_at_risk, breakeven,
                     score, score_liquidity, score_spread, score_delta, score_expiration,
-                    score_iv, reason, as_of
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    score_iv, underlying_last_price, sma20, sma50, trend_signal, trend_aligned,
+                    earnings_date, earnings_warning, breakeven_distance_pct, expected_move_pct,
+                    expected_move_to_breakeven_ok, favorable_2pct_value, favorable_2pct_pnl,
+                    adverse_2pct_value, adverse_2pct_pnl, decision_checklist, reason, as_of
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -194,6 +258,37 @@ class Storage:
                 conn,
             )
 
+    def add_watch_contract(
+        self,
+        contract_ticker: str,
+        underlying: str = None,
+        contract_type: str = None,
+        entry_price: float = None,
+        target_price: float = None,
+        stop_price: float = None,
+        notes: str = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO watched_contracts (
+                    contract_ticker, underlying, contract_type, entry_price, target_price, stop_price, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (contract_ticker, underlying, contract_type, entry_price, target_price, stop_price, notes),
+            )
+
+    def close_watch_contract(self, watch_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE watched_contracts SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (watch_id,),
+            )
+
+    def load_watchlist(self) -> pd.DataFrame:
+        with self._connect() as conn:
+            return pd.read_sql_query("SELECT * FROM watched_contracts ORDER BY id DESC", conn)
+
     def _read_latest(self, table: str, order_by: str) -> pd.DataFrame:
         with self._connect() as conn:
             latest = conn.execute("SELECT MAX(id) FROM scan_runs WHERE finished_at IS NOT NULL").fetchone()[0]
@@ -205,3 +300,15 @@ class Storage:
         conn = sqlite3.connect(self.db_path, timeout=SQLITE_TIMEOUT_SECONDS)
         conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
         return conn
+
+    def _ensure_columns(self, conn: sqlite3.Connection, table: str, columns: Dict[str, str]) -> None:
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for column, column_type in columns.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+
+def _bool_to_int(value) -> int:
+    if value is None:
+        return None
+    return 1 if value else 0

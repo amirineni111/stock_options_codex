@@ -4,7 +4,7 @@ from typing import List
 from pydantic import BaseModel
 
 from .config import AppSettings
-from .models import RejectedContract, ScoredContract
+from .models import MarketContext, RejectedContract, ScoredContract
 from .polygon import PolygonClient
 from .scoring import score_contracts
 from .storage import Storage
@@ -24,6 +24,10 @@ class ScanRequest(BaseModel):
     max_iv: float = 1.2
     max_contracts_per_ticker: int = 50
     allow_missing_spread: bool = False
+    use_trend_context: bool = True
+    require_trend_alignment: bool = False
+    check_earnings: bool = False
+    avoid_earnings_before_expiration: bool = False
 
 
 class ScanSummary(BaseModel):
@@ -45,13 +49,14 @@ def run_scan(settings: AppSettings, storage: Storage, request: ScanRequest) -> S
 
     for ticker in request.tickers:
         try:
+            market_context = _load_market_context(client, ticker, today, expiration_lte, request)
             contracts = client.get_option_chain_snapshots(
                 ticker,
                 expiration_gte=expiration_gte,
                 expiration_lte=expiration_lte,
                 limit=request.max_contracts_per_ticker,
             )
-            accepted, rejected = score_contracts(contracts, request)
+            accepted, rejected = score_contracts(contracts, request, market_context)
             all_accepted.extend(accepted)
             all_rejected.extend(rejected)
             summary.accepted += len(accepted)
@@ -75,3 +80,25 @@ def _sanitize_error(message: str, api_key: str = None) -> str:
     if api_key:
         safe = safe.replace(api_key, "REDACTED")
     return safe
+
+
+def _load_market_context(
+    client: PolygonClient,
+    ticker: str,
+    today: date,
+    expiration_lte: date,
+    request: ScanRequest,
+) -> MarketContext:
+    if not request.use_trend_context and not request.check_earnings:
+        return MarketContext(underlying=ticker.upper())
+    try:
+        return client.get_market_context(
+            ticker,
+            start=today - timedelta(days=110),
+            end=today,
+            earnings_end=expiration_lte,
+            check_earnings=request.check_earnings,
+        )
+    except Exception as exc:
+        warning = _sanitize_error(str(exc), client.api_key)
+        return MarketContext(underlying=ticker.upper(), earnings_warning=warning)

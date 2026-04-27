@@ -19,3 +19,21 @@ Days to expiration:          7 to 120
 Absolute delta range:        0.05 to 0.95
 Implied volatility range:    0.01 to 3.00
 Max contracts per ticker:    150
+
+-- Good understanding of option call option for PEP (pepsi) stock
+******************************************************************
+Strike: 155
+Option price: 5.45
+Contract cost: $545
+Expiration breakeven: 155 + 5.45 = 160.45
+Delta: 0.536
+**IF PEP moved today for $2 then
+Option move ≈ 0.536 x $2 = $1.07
+New option price ≈ 5.45 + 1.07 = 6.52
+New contract value ≈ $652 (profit $105)
+**But at expiration, it is different. If PEP expires at $157
+Intrinsic value = 157 - 155 = $2.00
+Contract value = $200
+You paid = $545
+Loss = about $345
+

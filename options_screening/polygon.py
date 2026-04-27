@@ -3,7 +3,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import httpx
 
-from .models import OptionContract
+from .models import MarketContext, OptionContract
 
 
 class PolygonClient:
@@ -70,6 +70,67 @@ class PolygonClient:
                 return float(value)
         return None
 
+    def get_market_context(
+        self,
+        ticker: str,
+        start: date,
+        end: date,
+        earnings_end: Optional[date] = None,
+        check_earnings: bool = False,
+    ) -> MarketContext:
+        closes = self.get_daily_closes(ticker, start, end)
+        last_price = closes[-1] if closes else self.get_stock_price(ticker)
+        sma20 = _simple_average(closes[-20:]) if len(closes) >= 20 else None
+        sma50 = _simple_average(closes[-50:]) if len(closes) >= 50 else None
+        trend_signal = _trend_signal(last_price, sma20, sma50)
+        earnings_date = None
+        earnings_warning = "not checked"
+        if check_earnings:
+            try:
+                earnings_date = self.get_next_earnings_date(ticker, date.today(), earnings_end or end)
+                earnings_warning = "before expiration" if earnings_date else "none found before expiration"
+            except RuntimeError as exc:
+                earnings_warning = str(exc)
+
+        return MarketContext(
+            underlying=ticker.upper(),
+            last_price=last_price,
+            sma20=sma20,
+            sma50=sma50,
+            trend_signal=trend_signal,
+            earnings_date=earnings_date,
+            earnings_warning=earnings_warning,
+        )
+
+    def get_daily_closes(self, ticker: str, start: date, end: date) -> List[float]:
+        payload = self._get(
+            f"/v2/aggs/ticker/{ticker.upper()}/range/1/day/{start.isoformat()}/{end.isoformat()}",
+            {"adjusted": "true", "sort": "asc", "limit": 5000},
+        )
+        closes = []
+        for item in payload.get("results") or []:
+            close = _first_float(item.get("c"))
+            if close is not None:
+                closes.append(close)
+        return closes
+
+    def get_next_earnings_date(self, ticker: str, start: date, end: date) -> Optional[date]:
+        payload = self._get(
+            "/benzinga/v1/earnings",
+            {
+                "ticker": ticker.upper(),
+                "date.gte": start.isoformat(),
+                "date.lte": end.isoformat(),
+                "sort": "date.asc",
+                "limit": 1,
+            },
+        )
+        results = payload.get("results") or []
+        if not results:
+            return None
+        raw_date = results[0].get("date")
+        return date.fromisoformat(raw_date) if raw_date else None
+
     def _parse_chain_snapshot(self, underlying: str, item: Dict[str, Any]) -> OptionContract:
         details = item.get("details") or {}
         greeks = item.get("greeks") or {}
@@ -126,3 +187,19 @@ def _first_int(*values: Any) -> Optional[int]:
         except (TypeError, ValueError):
             continue
     return None
+
+
+def _simple_average(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    return round(sum(values) / len(values), 4)
+
+
+def _trend_signal(last_price: Optional[float], sma20: Optional[float], sma50: Optional[float]) -> str:
+    if last_price is None or sma20 is None or sma50 is None:
+        return "unknown"
+    if last_price > sma20 > sma50:
+        return "bullish"
+    if last_price < sma20 < sma50:
+        return "bearish"
+    return "mixed"
