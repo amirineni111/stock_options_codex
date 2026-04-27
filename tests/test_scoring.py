@@ -80,10 +80,20 @@ def test_buy_call_candidate_when_checks_pass():
 
 
 def test_missing_spread_downgrades_to_watch_only():
-    request = ScanRequest(tickers=["AAPL"], allow_missing_spread=True)
+    request = ScanRequest(tickers=["AAPL"], allow_missing_spread=True, ignore_missing_spread_for_signal=False)
     market = MarketContext(underlying="AAPL", last_price=199.0, sma20=195.0, sma50=190.0, trend_signal="bullish")
     scored, rejected = score_contract(_contract(bid=None, ask=None), request, market)
 
     assert rejected is None
     assert scored.trade_signal == "WATCH_ONLY"
     assert "bid/ask spread unavailable" in scored.signal_reason
+
+
+def test_can_ignore_missing_spread_for_signal():
+    request = ScanRequest(tickers=["AAPL"], allow_missing_spread=True, ignore_missing_spread_for_signal=True)
+    market = MarketContext(underlying="AAPL", last_price=199.0, sma20=195.0, sma50=190.0, trend_signal="bullish")
+    scored, rejected = score_contract(_contract(bid=None, ask=None), request, market)
+
+    assert rejected is None
+    assert scored.trade_signal == "BUY_CALL_CANDIDATE"
+    assert "bid/ask spread unavailable" not in scored.signal_reason

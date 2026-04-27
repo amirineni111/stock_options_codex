@@ -255,8 +255,11 @@ def _trade_signal(
     avoid_reasons = []
     watch_reasons = []
 
-    if contract.spread_pct is None:
+    ignore_missing_spread = getattr(settings, "ignore_missing_spread_for_signal", False)
+    if contract.spread_pct is None and not ignore_missing_spread:
         watch_reasons.append("bid/ask spread unavailable")
+    elif contract.spread_pct is None and ignore_missing_spread:
+        pass
     elif contract.spread_pct > min(settings.max_spread_pct, 20.0):
         watch_reasons.append("bid/ask spread is wide")
 

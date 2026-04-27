@@ -28,6 +28,7 @@ class ScanRequest(BaseModel):
     require_trend_alignment: bool = False
     check_earnings: bool = False
     avoid_earnings_before_expiration: bool = False
+    ignore_missing_spread_for_signal: bool = True
 
 
 class ScanSummary(BaseModel):

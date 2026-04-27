@@ -39,6 +39,7 @@ DEFAULT_PREFERENCES = {
     "require_trend_alignment": False,
     "check_earnings": False,
     "avoid_earnings_before_expiration": False,
+    "ignore_missing_spread_for_signal": True,
     "auto_refresh_enabled": False,
     "refresh_unit": "minutes",
     "refresh_interval": 15,
@@ -365,6 +366,11 @@ def main() -> None:
         allow_missing_spread = st.checkbox("Allow missing bid-ask spread", value=bool(preferences["allow_missing_spread"]))
         if allow_missing_spread:
             st.warning("Contracts without bid/ask quotes can be ranked, but verify live quotes before trading.")
+        ignore_missing_spread_for_signal = st.checkbox(
+            "Ignore missing bid-ask for trade signal",
+            value=bool(preferences["ignore_missing_spread_for_signal"]),
+            disabled=not allow_missing_spread,
+        )
         min_dte, max_dte = st.slider("Days to expiration", 1, 180, _bounded_range(preferences["days_to_expiration"], 1, 180, (21, 75)))
         min_delta_abs, max_delta_abs = st.slider("Absolute delta range", 0.05, 0.95, _bounded_range(preferences["absolute_delta_range"], 0.05, 0.95, (0.25, 0.65)), 0.01)
         min_iv, max_iv = st.slider("Implied volatility range", 0.01, 3.0, _bounded_range(preferences["implied_volatility_range"], 0.01, 3.0, (0.05, 1.2)), 0.01)
@@ -445,6 +451,7 @@ def main() -> None:
                 "require_trend_alignment": bool(require_trend_alignment and use_trend_context),
                 "check_earnings": bool(check_earnings),
                 "avoid_earnings_before_expiration": bool(avoid_earnings_before_expiration and check_earnings),
+                "ignore_missing_spread_for_signal": bool(ignore_missing_spread_for_signal and allow_missing_spread),
                 "auto_refresh_enabled": bool(st.session_state.auto_refresh),
                 "refresh_unit": refresh_unit,
                 "refresh_interval": int(refresh_interval),
@@ -486,6 +493,7 @@ def main() -> None:
         require_trend_alignment=bool(require_trend_alignment and use_trend_context),
         check_earnings=bool(check_earnings),
         avoid_earnings_before_expiration=bool(avoid_earnings_before_expiration and check_earnings),
+        ignore_missing_spread_for_signal=bool(ignore_missing_spread_for_signal and allow_missing_spread),
     )
 
     run_col, info_col = st.columns([1, 4])
