@@ -33,6 +33,8 @@ DEFAULT_PREFERENCES = {
     "implied_volatility_range": [0.05, 1.2],
     "max_contracts_per_ticker": 50,
     "ticker_limit": 50,
+    "ticker_source": "S&P 500",
+    "custom_tickers": "",
     "use_trend_context": True,
     "require_trend_alignment": False,
     "check_earnings": False,
@@ -178,6 +180,19 @@ def _render_results_table(df: pd.DataFrame) -> None:
     )
 
 
+def _filter_by_underlying(df: pd.DataFrame, selected_underlyings) -> pd.DataFrame:
+    if df.empty or not selected_underlyings or "underlying" not in df.columns:
+        return df
+    return df[df["underlying"].isin(selected_underlyings)].copy()
+
+
+def _render_underlying_filter(df: pd.DataFrame, key: str):
+    if df.empty or "underlying" not in df.columns:
+        return []
+    options = sorted(df["underlying"].dropna().unique().tolist())
+    return st.multiselect("Filter underlying", options=options, default=[], key=key, placeholder="All underlyings")
+
+
 def _render_watchlist(storage: Storage, latest: pd.DataFrame) -> None:
     st.subheader("Watchlist")
     watchlist = storage.load_watchlist()
@@ -212,8 +227,10 @@ def _render_watchlist(storage: Storage, latest: pd.DataFrame) -> None:
         st.dataframe(watchlist, use_container_width=True, hide_index=True)
         return
 
-    st.dataframe(watchlist, use_container_width=True, hide_index=True)
-    open_ids = watchlist[watchlist["status"] == "watching"]["id"].tolist()
+    selected_underlyings = _render_underlying_filter(watchlist, "watchlist_underlying_filter")
+    filtered_watchlist = _filter_by_underlying(watchlist, selected_underlyings)
+    st.dataframe(filtered_watchlist, use_container_width=True, hide_index=True)
+    open_ids = filtered_watchlist[filtered_watchlist["status"] == "watching"]["id"].tolist()
     if open_ids:
         close_id = st.selectbox("Close watch item", open_ids)
         if st.button("Mark Closed"):
@@ -277,6 +294,18 @@ def _bounded_range(value, minimum, maximum, default):
     return lower, upper
 
 
+def _parse_custom_tickers(value: str) -> list:
+    tickers = []
+    seen = set()
+    for item in (value or "").replace("\n", ",").split(","):
+        ticker = item.strip().upper()
+        if not ticker or ticker in seen:
+            continue
+        seen.add(ticker)
+        tickers.append(ticker)
+    return tickers
+
+
 def _cleanup_pytest_cache_artifacts(root: Path = None) -> int:
     repo_root = (root or Path.cwd()).resolve()
     removed = 0
@@ -323,7 +352,24 @@ def main() -> None:
         min_delta_abs, max_delta_abs = st.slider("Absolute delta range", 0.05, 0.95, _bounded_range(preferences["absolute_delta_range"], 0.05, 0.95, (0.25, 0.65)), 0.01)
         min_iv, max_iv = st.slider("Implied volatility range", 0.01, 3.0, _bounded_range(preferences["implied_volatility_range"], 0.01, 3.0, (0.05, 1.2)), 0.01)
         max_contracts = st.number_input("Max contracts per ticker", min_value=5, max_value=250, value=_bounded_number(preferences["max_contracts_per_ticker"], 5, 250, 50), step=5)
+        st.subheader("Scan Universe")
+        ticker_source_options = ["S&P 500", "Custom"]
+        ticker_source = st.radio(
+            "Ticker source",
+            ticker_source_options,
+            index=ticker_source_options.index(preferences["ticker_source"]) if preferences["ticker_source"] in ticker_source_options else 0,
+            horizontal=True,
+        )
         ticker_limit = st.number_input("Ticker scan limit", min_value=1, max_value=503, value=_bounded_number(preferences["ticker_limit"], 1, 503, 50), step=5)
+        custom_tickers = st.text_area(
+            "Custom tickers",
+            value=str(preferences["custom_tickers"]),
+            placeholder="AAPL, MSFT, NVDA, SPY, QQQ",
+            disabled=ticker_source != "Custom",
+        )
+        if ticker_source == "Custom":
+            parsed_custom_tickers = _parse_custom_tickers(custom_tickers)
+            st.caption(f"Custom scan list: {len(parsed_custom_tickers)} ticker(s).")
         st.subheader("Decision Checks")
         use_trend_context = st.checkbox("Add stock trend context", value=bool(preferences["use_trend_context"]))
         require_trend_alignment = st.checkbox(
@@ -376,6 +422,8 @@ def main() -> None:
                 "implied_volatility_range": [float(min_iv), float(max_iv)],
                 "max_contracts_per_ticker": int(max_contracts),
                 "ticker_limit": int(ticker_limit),
+                "ticker_source": ticker_source,
+                "custom_tickers": custom_tickers,
                 "use_trend_context": bool(use_trend_context),
                 "require_trend_alignment": bool(require_trend_alignment and use_trend_context),
                 "check_earnings": bool(check_earnings),
@@ -392,7 +440,12 @@ def main() -> None:
     if universe_note:
         st.warning(universe_note)
 
-    selected_tickers = tickers[: int(ticker_limit)]
+    if ticker_source == "Custom":
+        selected_tickers = _parse_custom_tickers(custom_tickers)
+        if not selected_tickers:
+            st.warning("Add at least one custom ticker to run a custom scan.")
+    else:
+        selected_tickers = tickers[: int(ticker_limit)]
     if not settings.polygon_api_key:
         st.error("Add POLYGON_API_KEY to .env, then restart Streamlit or rerun the app.")
 
@@ -420,9 +473,10 @@ def main() -> None:
 
     run_col, info_col = st.columns([1, 4])
     with run_col:
-        run_now = st.button("Run Scan", type="primary", disabled=not bool(settings.polygon_api_key))
+        run_now = st.button("Run Scan", type="primary", disabled=not bool(settings.polygon_api_key) or not selected_tickers)
     with info_col:
-        st.write(f"Universe: S&P 500 first {len(selected_tickers)} tickers. Refresh target: {refresh_label} during market hours.")
+        universe_label = "custom list" if ticker_source == "Custom" else "S&P 500"
+        st.write(f"Universe: {universe_label}, {len(selected_tickers)} tickers. Refresh target: {refresh_label} during market hours.")
 
     auto_count = None
     if st.session_state.auto_refresh:
@@ -437,6 +491,7 @@ def main() -> None:
     auto_due = (
         st.session_state.auto_refresh
         and bool(settings.polygon_api_key)
+        and bool(selected_tickers)
         and is_regular_market_hours()
         and auto_count is not None
         and auto_count != st.session_state.last_auto_refresh_count
@@ -465,24 +520,30 @@ def main() -> None:
     puts = latest[latest["contract_type"] == "put"].copy() if not latest.empty else latest
 
     with tabs[0]:
-        _render_metric_row(calls)
-        _render_results_table(calls)
-        if not calls.empty:
-            st.download_button("Export Calls CSV", calls.to_csv(index=False), "ranked_calls.csv", "text/csv")
+        call_underlyings = _render_underlying_filter(calls, "calls_underlying_filter")
+        filtered_calls = _filter_by_underlying(calls, call_underlyings)
+        _render_metric_row(filtered_calls)
+        _render_results_table(filtered_calls)
+        if not filtered_calls.empty:
+            st.download_button("Export Calls CSV", filtered_calls.to_csv(index=False), "ranked_calls.csv", "text/csv")
 
     with tabs[1]:
-        _render_metric_row(puts)
-        _render_results_table(puts)
-        if not puts.empty:
-            st.download_button("Export Puts CSV", puts.to_csv(index=False), "ranked_puts.csv", "text/csv")
+        put_underlyings = _render_underlying_filter(puts, "puts_underlying_filter")
+        filtered_puts = _filter_by_underlying(puts, put_underlyings)
+        _render_metric_row(filtered_puts)
+        _render_results_table(filtered_puts)
+        if not filtered_puts.empty:
+            st.download_button("Export Puts CSV", filtered_puts.to_csv(index=False), "ranked_puts.csv", "text/csv")
 
     with tabs[2]:
-        ticker = st.selectbox("Ticker", selected_tickers)
+        detail_tickers = sorted(latest["underlying"].dropna().unique().tolist()) if not latest.empty else selected_tickers
+        ticker = st.selectbox("Ticker", detail_tickers)
         detail = latest[latest["underlying"] == ticker].copy() if not latest.empty else latest
         _render_results_table(detail)
 
     with tabs[3]:
-        st.dataframe(rejected, use_container_width=True, hide_index=True)
+        rejected_underlyings = _render_underlying_filter(rejected, "rejected_underlying_filter")
+        st.dataframe(_filter_by_underlying(rejected, rejected_underlyings), use_container_width=True, hide_index=True)
 
     with tabs[4]:
         st.dataframe(logs, use_container_width=True, hide_index=True)
