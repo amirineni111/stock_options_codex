@@ -23,6 +23,7 @@ class ScanRequest(BaseModel):
     min_iv: float = 0.05
     max_iv: float = 1.2
     max_contracts_per_ticker: int = 50
+    allow_missing_spread: bool = False
 
 
 class ScanSummary(BaseModel):

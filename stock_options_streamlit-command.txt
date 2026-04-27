@@ -10,3 +10,12 @@ Stop-Process -Name streamlit
 --to browse app in browser
 
 http://localhost:8501
+-- tool settings to improve scan
+Fixed dollar max risk:        750
+Minimum volume:              0
+Minimum open interest:       0
+Maximum bid-ask spread %:    50
+Days to expiration:          7 to 120
+Absolute delta range:        0.05 to 0.95
+Implied volatility range:    0.01 to 3.00
+Max contracts per ticker:    150

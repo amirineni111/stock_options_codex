@@ -44,6 +44,23 @@ def test_rejects_wide_spread():
     assert "spread" in rejected.reason
 
 
+def test_rejects_missing_spread_by_default():
+    request = ScanRequest(tickers=["AAPL"])
+    scored, rejected = score_contract(_contract(bid=None, ask=None), request)
+
+    assert scored is None
+    assert "spread" in rejected.reason
+
+
+def test_can_score_missing_spread_when_allowed():
+    request = ScanRequest(tickers=["AAPL"], allow_missing_spread=True)
+    scored, rejected = score_contract(_contract(bid=None, ask=None), request)
+
+    assert rejected is None
+    assert scored.score_components["spread"] == 0.0
+    assert "bid-ask spread is unavailable" in scored.reason
+
+
 def test_rejects_contract_above_fixed_risk():
     request = ScanRequest(tickers=["AAPL"], fixed_risk=100)
     scored, rejected = score_contract(_contract(bid=2.4, ask=2.6), request)

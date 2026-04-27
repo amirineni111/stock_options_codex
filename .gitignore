@@ -5,4 +5,5 @@ __pycache__/
 pytest-cache-files-*/
 data/*.sqlite3
 data/*.sqlite3-*
+data/app_preferences.json
 *.pyc

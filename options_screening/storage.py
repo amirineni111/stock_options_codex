@@ -7,6 +7,9 @@ import pandas as pd
 
 from .models import RejectedContract, ScoredContract
 
+SQLITE_TIMEOUT_SECONDS = 30.0
+SQLITE_BUSY_TIMEOUT_MS = 30000
+
 
 class Storage:
     def __init__(self, db_path: Path) -> None:
@@ -16,6 +19,8 @@ class Storage:
     def initialize(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS scan_runs (
@@ -197,4 +202,6 @@ class Storage:
             return pd.read_sql_query(f"SELECT * FROM {table} WHERE scan_id = ? {order_by}", conn, params=(latest,))
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=SQLITE_TIMEOUT_SECONDS)
+        conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+        return conn

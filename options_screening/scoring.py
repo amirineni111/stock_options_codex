@@ -23,7 +23,10 @@ def score_contract(contract: OptionContract, settings) -> Tuple[ScoredContract, 
     mid = contract.mid_price or 0.0
 
     liquidity_score = min(25.0, (min(volume / max(settings.min_volume, 1), 2.0) / 2.0) * 10.0 + (min(oi / max(settings.min_open_interest, 1), 2.0) / 2.0) * 15.0)
-    spread_score = max(0.0, 25.0 * (1.0 - spread_pct / settings.max_spread_pct))
+    if contract.spread_pct is None:
+        spread_score = 0.0
+    else:
+        spread_score = max(0.0, 25.0 * (1.0 - spread_pct / settings.max_spread_pct))
     delta_midpoint = (settings.min_abs_delta + settings.max_abs_delta) / 2.0
     delta_width = max((settings.max_abs_delta - settings.min_abs_delta) / 2.0, 0.01)
     delta_score = max(0.0, 20.0 * (1.0 - abs(abs_delta - delta_midpoint) / delta_width))
@@ -53,7 +56,7 @@ def score_contract(contract: OptionContract, settings) -> Tuple[ScoredContract, 
         max_contracts_by_risk=max_contracts,
         premium_at_risk=premium_at_risk,
         breakeven=round(breakeven, 2),
-        reason="Accepted: liquid, defined-risk premium, and within conservative swing filters.",
+        reason=_accepted_reason(contract),
     )
     return result, None
 
@@ -80,7 +83,9 @@ def _validate_contract(contract: OptionContract, settings) -> RejectedContract:
         reasons.append("outside DTE range")
     if contract.mid_price is None or contract.mid_price <= 0:
         reasons.append("missing positive price")
-    if contract.spread_pct is None or contract.spread_pct > settings.max_spread_pct:
+    if contract.spread_pct is None and not settings.allow_missing_spread:
+        reasons.append("spread too wide or unavailable")
+    elif contract.spread_pct is not None and contract.spread_pct > settings.max_spread_pct:
         reasons.append("spread too wide or unavailable")
     if (contract.volume or 0) < settings.min_volume:
         reasons.append("volume below minimum")
@@ -102,3 +107,9 @@ def _validate_contract(contract: OptionContract, settings) -> RejectedContract:
         reason=", ".join(reasons),
         as_of=contract.as_of,
     )
+
+
+def _accepted_reason(contract: OptionContract) -> str:
+    if contract.spread_pct is None:
+        return "Accepted: matched filters, but bid-ask spread is unavailable; verify quote before trading."
+    return "Accepted: liquid, defined-risk premium, and within conservative swing filters."

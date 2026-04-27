@@ -17,9 +17,12 @@ Edit `.env` and set:
 
 ```text
 POLYGON_API_KEY=your_polygon_key
+OPTIONS_DB_PATH=%LOCALAPPDATA%\StockOptionsCodex\options_screening.sqlite3
 ```
 
 Real-time options data requires Polygon permissions that may need a paid plan.
+
+Keeping the SQLite database outside OneDrive or other synced folders helps avoid file-locking errors during scans.
 
 ## Run
 
