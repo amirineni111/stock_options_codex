@@ -179,6 +179,7 @@ def _decision_context(
         "adverse_2pct_value": adverse_value,
         "adverse_2pct_pnl": adverse_pnl,
         "decision_checklist": _decision_checklist(contract, trend_aligned, expected_move_ok, market_context),
+        **_trade_signal(contract, settings, market_context, trend_aligned, expected_move_ok),
     }
 
 
@@ -242,6 +243,72 @@ def _decision_checklist(
     else:
         items.append("earnings not checked")
     return "; ".join(items)
+
+
+def _trade_signal(
+    contract: OptionContract,
+    settings,
+    market_context: Optional[MarketContext],
+    trend_aligned: Optional[bool],
+    expected_move_ok: Optional[bool],
+) -> dict:
+    avoid_reasons = []
+    watch_reasons = []
+
+    if contract.spread_pct is None:
+        watch_reasons.append("bid/ask spread unavailable")
+    elif contract.spread_pct > min(settings.max_spread_pct, 20.0):
+        watch_reasons.append("bid/ask spread is wide")
+
+    if trend_aligned is False:
+        watch_reasons.append("trend is not aligned")
+    elif trend_aligned is None:
+        watch_reasons.append("trend is unknown")
+
+    if expected_move_ok is False:
+        watch_reasons.append("breakeven is beyond rough expected move")
+    elif expected_move_ok is None:
+        watch_reasons.append("expected move is unknown")
+
+    if market_context and market_context.earnings_date:
+        watch_reasons.append("earnings before expiration")
+
+    if contract.volume is None or contract.open_interest is None:
+        watch_reasons.append("liquidity data incomplete")
+    elif contract.volume < max(settings.min_volume, 10) or contract.open_interest < max(settings.min_open_interest, 100):
+        watch_reasons.append("liquidity is thin")
+
+    if contract.mid_price is None or contract.mid_price <= 0:
+        avoid_reasons.append("option price unavailable")
+    if contract.mid_price and contract.mid_price * 100 > settings.fixed_risk:
+        avoid_reasons.append("one contract exceeds fixed risk")
+
+    if avoid_reasons:
+        return {"trade_signal": "AVOID", "signal_reason": "; ".join(avoid_reasons)}
+
+    if watch_reasons:
+        signal = "WATCH_ONLY"
+        if _covered_or_cash_secured_candidate(contract, trend_aligned):
+            signal = _income_signal(contract)
+        return {"trade_signal": signal, "signal_reason": "; ".join(watch_reasons)}
+
+    if contract.contract_type == "call":
+        return {"trade_signal": "BUY_CALL_CANDIDATE", "signal_reason": "trend, liquidity, spread, and expected move checks passed"}
+    if contract.contract_type == "put":
+        return {"trade_signal": "BUY_PUT_CANDIDATE", "signal_reason": "trend, liquidity, spread, and expected move checks passed"}
+    return {"trade_signal": "AVOID", "signal_reason": "unsupported contract type"}
+
+
+def _covered_or_cash_secured_candidate(contract: OptionContract, trend_aligned: Optional[bool]) -> bool:
+    return trend_aligned is False and contract.spread_pct is not None
+
+
+def _income_signal(contract: OptionContract) -> str:
+    if contract.contract_type == "call":
+        return "COVERED_CALL_ONLY"
+    if contract.contract_type == "put":
+        return "CASH_SECURED_PUT_ONLY"
+    return "WATCH_ONLY"
 
 
 def _round_optional(value: Optional[float]) -> Optional[float]:

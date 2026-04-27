@@ -60,6 +60,8 @@ class ScoredContract(BaseModel):
     adverse_2pct_value: Optional[float] = None
     adverse_2pct_pnl: Optional[float] = None
     decision_checklist: Optional[str] = None
+    trade_signal: Optional[str] = None
+    signal_reason: Optional[str] = None
 
 
 class MarketContext(BaseModel):

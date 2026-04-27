@@ -1,6 +1,6 @@
 from datetime import date, timedelta
 
-from options_screening.models import OptionContract
+from options_screening.models import MarketContext, OptionContract
 from options_screening.scanner import ScanRequest
 from options_screening.scoring import score_contract
 
@@ -67,3 +67,23 @@ def test_rejects_contract_above_fixed_risk():
 
     assert scored is None
     assert "fixed risk" in rejected.reason
+
+
+def test_buy_call_candidate_when_checks_pass():
+    request = ScanRequest(tickers=["AAPL"], fixed_risk=500)
+    market = MarketContext(underlying="AAPL", last_price=199.0, sma20=195.0, sma50=190.0, trend_signal="bullish")
+    scored, rejected = score_contract(_contract(strike_price=200.0, bid=2.4, ask=2.6), request, market)
+
+    assert rejected is None
+    assert scored.trade_signal == "BUY_CALL_CANDIDATE"
+    assert "checks passed" in scored.signal_reason
+
+
+def test_missing_spread_downgrades_to_watch_only():
+    request = ScanRequest(tickers=["AAPL"], allow_missing_spread=True)
+    market = MarketContext(underlying="AAPL", last_price=199.0, sma20=195.0, sma50=190.0, trend_signal="bullish")
+    scored, rejected = score_contract(_contract(bid=None, ask=None), request, market)
+
+    assert rejected is None
+    assert scored.trade_signal == "WATCH_ONLY"
+    assert "bid/ask spread unavailable" in scored.signal_reason

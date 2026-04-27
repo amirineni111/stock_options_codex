@@ -25,6 +25,8 @@ SCAN_RESULT_EXTRA_COLUMNS = {
     "adverse_2pct_value": "REAL",
     "adverse_2pct_pnl": "REAL",
     "decision_checklist": "TEXT",
+    "trade_signal": "TEXT",
+    "signal_reason": "TEXT",
 }
 
 
@@ -94,6 +96,8 @@ class Storage:
                     adverse_2pct_value REAL,
                     adverse_2pct_pnl REAL,
                     decision_checklist TEXT,
+                    trade_signal TEXT,
+                    signal_reason TEXT,
                     reason TEXT,
                     as_of TEXT
                 );
@@ -198,6 +202,8 @@ class Storage:
                     result.adverse_2pct_value,
                     result.adverse_2pct_pnl,
                     result.decision_checklist,
+                    result.trade_signal,
+                    result.signal_reason,
                     result.reason,
                     c.as_of.isoformat(),
                 )
@@ -216,8 +222,9 @@ class Storage:
                     score_iv, underlying_last_price, sma20, sma50, trend_signal, trend_aligned,
                     earnings_date, earnings_warning, breakeven_distance_pct, expected_move_pct,
                     expected_move_to_breakeven_ok, favorable_2pct_value, favorable_2pct_pnl,
-                    adverse_2pct_value, adverse_2pct_pnl, decision_checklist, reason, as_of
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    adverse_2pct_value, adverse_2pct_pnl, decision_checklist, trade_signal,
+                    signal_reason, reason, as_of
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )

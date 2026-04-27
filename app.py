@@ -61,6 +61,8 @@ RESULT_COLUMN_GUIDE = [
     ("max_contracts_by_risk", "How many contracts fit inside your fixed-dollar max risk setting.", "1"),
     ("premium_at_risk", "Estimated dollars at risk for max_contracts_by_risk contracts.", "545.00"),
     ("breakeven", "Expiration breakeven. Calls: strike + premium. Puts: strike - premium.", "160.45"),
+    ("trade_signal", "Rule-based decision label. It is a candidate/watch/avoid signal, not a guaranteed trade.", "BUY_CALL_CANDIDATE"),
+    ("signal_reason", "Plain-English reason for the signal, including warnings that downgraded the setup.", "bid/ask spread unavailable"),
     ("underlying_last_price", "Latest underlying stock price used for trend and scenario checks.", "154.20"),
     ("sma20", "20-day simple moving average of the underlying stock.", "151.80"),
     ("sma50", "50-day simple moving average of the underlying stock.", "148.40"),
@@ -127,6 +129,8 @@ def _format_results(df: pd.DataFrame) -> pd.DataFrame:
         "max_contracts_by_risk",
         "premium_at_risk",
         "breakeven",
+        "trade_signal",
+        "signal_reason",
         "decision_checklist",
         "trend_signal",
         "trend_aligned",
@@ -191,6 +195,19 @@ def _render_underlying_filter(df: pd.DataFrame, key: str):
         return []
     options = sorted(df["underlying"].dropna().unique().tolist())
     return st.multiselect("Filter underlying", options=options, default=[], key=key, placeholder="All underlyings")
+
+
+def _render_signal_filter(df: pd.DataFrame, key: str):
+    if df.empty or "trade_signal" not in df.columns:
+        return []
+    options = sorted(df["trade_signal"].dropna().unique().tolist())
+    return st.multiselect("Filter signal", options=options, default=[], key=key, placeholder="All signals")
+
+
+def _filter_by_signal(df: pd.DataFrame, selected_signals) -> pd.DataFrame:
+    if df.empty or not selected_signals or "trade_signal" not in df.columns:
+        return df
+    return df[df["trade_signal"].isin(selected_signals)].copy()
 
 
 def _render_watchlist(storage: Storage, latest: pd.DataFrame) -> None:
@@ -521,7 +538,8 @@ def main() -> None:
 
     with tabs[0]:
         call_underlyings = _render_underlying_filter(calls, "calls_underlying_filter")
-        filtered_calls = _filter_by_underlying(calls, call_underlyings)
+        call_signals = _render_signal_filter(calls, "calls_signal_filter")
+        filtered_calls = _filter_by_signal(_filter_by_underlying(calls, call_underlyings), call_signals)
         _render_metric_row(filtered_calls)
         _render_results_table(filtered_calls)
         if not filtered_calls.empty:
@@ -529,7 +547,8 @@ def main() -> None:
 
     with tabs[1]:
         put_underlyings = _render_underlying_filter(puts, "puts_underlying_filter")
-        filtered_puts = _filter_by_underlying(puts, put_underlyings)
+        put_signals = _render_signal_filter(puts, "puts_signal_filter")
+        filtered_puts = _filter_by_signal(_filter_by_underlying(puts, put_underlyings), put_signals)
         _render_metric_row(filtered_puts)
         _render_results_table(filtered_puts)
         if not filtered_puts.empty:
