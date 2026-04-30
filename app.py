@@ -53,6 +53,8 @@ DEFAULT_PREFERENCES = {
     "intraday_min_day_change_pct": 0.5,
     "intraday_max_spread_pct": 1.0,
     "intraday_include_shorts": True,
+    "intraday_use_rsi_confirmation": True,
+    "intraday_use_trend_confirmation": True,
     "intraday_auto_refresh_enabled": False,
     "intraday_refresh_interval": 15,
 }
@@ -99,6 +101,16 @@ RESULT_COLUMN_GUIDE = [
     ("score_iv", "Score for IV within your selected IV range. Lower IV in range scores better. Max is 15.", "14.15"),
     ("reason", "Why the contract was accepted, including warnings such as missing bid/ask spread.", "Accepted...verify quote"),
     ("as_of", "When the option snapshot was parsed, shown in Eastern Time.", "2026-04-27 10:22:26 EDT"),
+]
+INTRADAY_COLUMN_GUIDE = [
+    ("rsi14", "Momentum oscillator from 0 to 100. Above 50 supports bullish momentum; below 50 supports bearish momentum. Extreme readings can favor mean reversion.", "Bullish momentum: 50-70. Oversold: below 30. Overbought: above 70."),
+    ("ema9", "Fast intraday exponential moving average. It reacts quicker than EMA20 and helps show short-term direction.", "Bullish momentum prefers price >= EMA9 >= EMA20."),
+    ("ema20", "Slower intraday exponential moving average. It gives the fast EMA a trend baseline.", "Bearish momentum prefers price <= EMA9 <= EMA20."),
+    ("macd", "Difference between EMA12 and EMA26. Positive means short-term price trend is above the slower trend; negative means below.", "MACD above signal is bullish; below signal is bearish."),
+    ("macd_signal", "EMA9 of MACD. Use it as the comparison line for MACD.", "MACD crossing above signal supports bullish momentum."),
+    ("macd_histogram", "MACD minus MACD signal. This is the quickest MACD read: positive favors bullish momentum, negative favors bearish momentum.", "Rising positive histogram means momentum is strengthening."),
+    ("vwap", "Volume-weighted average price for the current intraday session. Price above VWAP favors bullish acceptance; below VWAP favors bearish acceptance.", "Longs prefer price above VWAP; shorts prefer price below VWAP."),
+    ("signal_reason", "Plain-English summary of why the row became a candidate, watch, or avoid signal.", "May mention RSI, EMA/MACD/VWAP, spread, or volume."),
 ]
 
 
@@ -242,6 +254,13 @@ def _render_intraday_table(df: pd.DataFrame) -> None:
         "low",
         "prev_close",
         "minute_price",
+        "rsi14",
+        "ema9",
+        "ema20",
+        "macd",
+        "macd_signal",
+        "macd_histogram",
+        "vwap",
         "spread_pct",
         "signal_mode",
         "momentum_score",
@@ -253,7 +272,29 @@ def _render_intraday_table(df: pd.DataFrame) -> None:
         "as_of",
     ]
     available = [col for col in columns if col in df.columns]
-    st.dataframe(df[available].copy() if not df.empty else df, use_container_width=True, hide_index=True)
+    _render_intraday_column_guide()
+    st.dataframe(
+        df[available].copy() if not df.empty else df,
+        use_container_width=True,
+        hide_index=True,
+        column_config=_intraday_column_config(),
+    )
+
+
+def _intraday_column_config() -> dict:
+    return {
+        column: st.column_config.Column(label=column, help=meaning)
+        for column, meaning, _ in INTRADAY_COLUMN_GUIDE
+    }
+
+
+def _render_intraday_column_guide() -> None:
+    guide = pd.DataFrame(
+        [{"Column": column, "How to read it": meaning, "Example": example} for column, meaning, example in INTRADAY_COLUMN_GUIDE]
+    )
+    with st.expander("Indicator guide"):
+        st.dataframe(guide, use_container_width=True, hide_index=True)
+        st.caption("MACD quick read: compare MACD to signal, then use histogram for strength. Histogram above 0 favors bullish momentum; below 0 favors bearish momentum.")
 
 
 def _filter_intraday_results(df: pd.DataFrame, tickers, signals, modes, min_score: float) -> pd.DataFrame:
@@ -346,6 +387,8 @@ def _render_intraday_page(settings, storage: Storage, preferences: dict) -> None
         min_day_change_pct = st.number_input("Min day change %", min_value=0.0, max_value=20.0, value=_bounded_number(preferences["intraday_min_day_change_pct"], 0.0, 20.0, 0.5), step=0.1)
         max_spread_pct = st.number_input("Max spread %", min_value=0.01, max_value=20.0, value=_bounded_number(preferences["intraday_max_spread_pct"], 0.01, 20.0, 1.0), step=0.1)
         include_shorts = st.checkbox("Include short candidates", value=bool(preferences["intraday_include_shorts"]))
+        use_rsi_confirmation = st.checkbox("Use RSI confirmation", value=bool(preferences["intraday_use_rsi_confirmation"]))
+        use_trend_confirmation = st.checkbox("Use EMA/MACD/VWAP confirmation", value=bool(preferences["intraday_use_trend_confirmation"]))
         st.subheader("Auto Refresh")
         st.session_state.intraday_auto_refresh = st.checkbox(
             "Auto-refresh during market hours",
@@ -383,6 +426,8 @@ def _render_intraday_page(settings, storage: Storage, preferences: dict) -> None
                 "intraday_min_day_change_pct": float(min_day_change_pct),
                 "intraday_max_spread_pct": float(max_spread_pct),
                 "intraday_include_shorts": bool(include_shorts),
+                "intraday_use_rsi_confirmation": bool(use_rsi_confirmation),
+                "intraday_use_trend_confirmation": bool(use_trend_confirmation),
                 "intraday_auto_refresh_enabled": bool(st.session_state.intraday_auto_refresh),
                 "intraday_refresh_interval": int(intraday_refresh_interval),
             }
@@ -402,6 +447,8 @@ def _render_intraday_page(settings, storage: Storage, preferences: dict) -> None
         min_day_change_pct=float(min_day_change_pct),
         max_spread_pct=float(max_spread_pct),
         include_shorts=bool(include_shorts),
+        use_rsi_confirmation=bool(use_rsi_confirmation),
+        use_trend_confirmation=bool(use_trend_confirmation),
     )
 
     run_col, info_col = st.columns([1, 4])
@@ -564,12 +611,23 @@ def _load_app_preferences() -> dict:
         return preferences
     if isinstance(saved, dict):
         preferences.update(saved)
+    if preferences.get("intraday_universe") == "Custom" and not str(preferences.get("intraday_custom_tickers") or "").strip():
+        preferences["intraday_custom_tickers"] = str(preferences.get("custom_tickers") or "")
     return preferences
 
 
 def _save_app_preferences(preferences: dict) -> None:
     APP_PREFERENCES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    APP_PREFERENCES_PATH.write_text(json.dumps(preferences, indent=2, sort_keys=True), encoding="utf-8")
+    merged = dict(DEFAULT_PREFERENCES)
+    if APP_PREFERENCES_PATH.exists():
+        try:
+            saved = json.loads(APP_PREFERENCES_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            saved = {}
+        if isinstance(saved, dict):
+            merged.update(saved)
+    merged.update(preferences)
+    APP_PREFERENCES_PATH.write_text(json.dumps(merged, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def _bounded_number(value, minimum, maximum, default):

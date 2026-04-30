@@ -29,6 +29,15 @@ SCAN_RESULT_EXTRA_COLUMNS = {
     "trade_signal": "TEXT",
     "signal_reason": "TEXT",
 }
+INTRADAY_RESULT_EXTRA_COLUMNS = {
+    "rsi14": "REAL",
+    "ema9": "REAL",
+    "ema20": "REAL",
+    "macd": "REAL",
+    "macd_signal": "REAL",
+    "macd_histogram": "REAL",
+    "vwap": "REAL",
+}
 
 
 class Storage:
@@ -146,6 +155,13 @@ class Storage:
                     low REAL,
                     prev_close REAL,
                     minute_price REAL,
+                    rsi14 REAL,
+                    ema9 REAL,
+                    ema20 REAL,
+                    macd REAL,
+                    macd_signal REAL,
+                    macd_histogram REAL,
+                    vwap REAL,
                     spread_pct REAL,
                     signal_mode TEXT,
                     momentum_score REAL,
@@ -178,6 +194,7 @@ class Storage:
                 """
             )
             self._ensure_columns(conn, "scan_results", SCAN_RESULT_EXTRA_COLUMNS)
+            self._ensure_columns(conn, "intraday_results", INTRADAY_RESULT_EXTRA_COLUMNS)
 
     def start_scan(self, request: Dict) -> int:
         with self._connect() as conn:
@@ -353,6 +370,13 @@ class Storage:
                 r.low,
                 r.prev_close,
                 r.minute_price,
+                r.rsi14,
+                r.ema9,
+                r.ema20,
+                r.macd,
+                r.macd_signal,
+                r.macd_histogram,
+                r.vwap,
                 r.spread_pct,
                 r.signal_mode,
                 r.momentum_score,
@@ -374,10 +398,11 @@ class Storage:
                     """
                     INSERT INTO intraday_results (
                         rank, ticker, last_price, day_change_pct, volume, relative_volume,
-                        open, high, low, prev_close, minute_price, spread_pct, signal_mode,
+                        open, high, low, prev_close, minute_price, rsi14, ema9, ema20,
+                        macd, macd_signal, macd_histogram, vwap, spread_pct, signal_mode,
                         momentum_score, mean_reversion_score, total_score, trade_signal,
                         signal_reason, risk_notes, as_of
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     result_rows,
                 )
