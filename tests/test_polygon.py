@@ -66,3 +66,25 @@ def test_polygon_http_errors_redact_api_key(monkeypatch):
     message = str(exc_info.value)
     assert api_key not in message
     assert "apiKey=REDACTED" in message
+
+
+def test_stock_snapshots_fall_back_to_single_ticker_on_bulk_403(monkeypatch):
+    calls = []
+
+    def fake_get(self, path, params=None):
+        calls.append(path)
+        if path == "/v2/snapshot/locale/us/markets/stocks/tickers":
+            raise RuntimeError("Polygon API error 403 for bulk")
+        return {"ticker": {"ticker": path.rsplit("/", 1)[-1], "day": {"c": 123.0}}}
+
+    monkeypatch.setattr(PolygonClient, "_get", fake_get)
+
+    client = PolygonClient("test")
+    snapshots = client.get_stock_snapshots(["AAPL", "MSFT"])
+
+    assert [item["ticker"] for item in snapshots] == ["AAPL", "MSFT"]
+    assert calls == [
+        "/v2/snapshot/locale/us/markets/stocks/tickers",
+        "/v2/snapshot/locale/us/markets/stocks/tickers/AAPL",
+        "/v2/snapshot/locale/us/markets/stocks/tickers/MSFT",
+    ]

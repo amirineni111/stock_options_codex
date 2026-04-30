@@ -5,6 +5,7 @@ from typing import Dict, Iterable, List
 
 import pandas as pd
 
+from .intraday import IntradayResult
 from .models import RejectedContract, ScoredContract
 
 SQLITE_TIMEOUT_SECONDS = 30.0
@@ -124,6 +125,48 @@ class Storage:
                     contract_ticker TEXT NOT NULL,
                     underlying TEXT,
                     contract_type TEXT,
+                    entry_price REAL,
+                    target_price REAL,
+                    stop_price REAL,
+                    notes TEXT,
+                    status TEXT DEFAULT 'watching',
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    closed_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS intraday_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    rank INTEGER,
+                    ticker TEXT,
+                    last_price REAL,
+                    day_change_pct REAL,
+                    volume INTEGER,
+                    relative_volume REAL,
+                    open REAL,
+                    high REAL,
+                    low REAL,
+                    prev_close REAL,
+                    minute_price REAL,
+                    spread_pct REAL,
+                    signal_mode TEXT,
+                    momentum_score REAL,
+                    mean_reversion_score REAL,
+                    total_score REAL,
+                    trade_signal TEXT,
+                    signal_reason TEXT,
+                    risk_notes TEXT,
+                    as_of TEXT
+                );
+                CREATE TABLE IF NOT EXISTS intraday_scan_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT,
+                    signal TEXT,
+                    error TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS intraday_watchlist (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    signal TEXT,
                     entry_price REAL,
                     target_price REAL,
                     stop_price REAL,
@@ -295,6 +338,91 @@ class Storage:
     def load_watchlist(self) -> pd.DataFrame:
         with self._connect() as conn:
             return pd.read_sql_query("SELECT * FROM watched_contracts ORDER BY id DESC", conn)
+
+    def save_intraday_scan(self, results: Iterable[IntradayResult], logs: Iterable[Dict]) -> None:
+        result_rows = [
+            (
+                r.rank,
+                r.ticker,
+                r.last_price,
+                r.day_change_pct,
+                r.volume,
+                r.relative_volume,
+                r.open,
+                r.high,
+                r.low,
+                r.prev_close,
+                r.minute_price,
+                r.spread_pct,
+                r.signal_mode,
+                r.momentum_score,
+                r.mean_reversion_score,
+                r.total_score,
+                r.trade_signal,
+                r.signal_reason,
+                r.risk_notes,
+                r.as_of.isoformat(),
+            )
+            for r in results
+        ]
+        log_rows = [(row.get("ticker"), row.get("signal"), row.get("error"), row.get("created_at")) for row in logs]
+        with self._connect() as conn:
+            conn.execute("DELETE FROM intraday_results")
+            conn.execute("DELETE FROM intraday_scan_logs")
+            if result_rows:
+                conn.executemany(
+                    """
+                    INSERT INTO intraday_results (
+                        rank, ticker, last_price, day_change_pct, volume, relative_volume,
+                        open, high, low, prev_close, minute_price, spread_pct, signal_mode,
+                        momentum_score, mean_reversion_score, total_score, trade_signal,
+                        signal_reason, risk_notes, as_of
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    result_rows,
+                )
+            if log_rows:
+                conn.executemany(
+                    "INSERT INTO intraday_scan_logs (ticker, signal, error, created_at) VALUES (?, ?, ?, ?)",
+                    log_rows,
+                )
+
+    def load_intraday_results(self) -> pd.DataFrame:
+        with self._connect() as conn:
+            return pd.read_sql_query("SELECT * FROM intraday_results ORDER BY total_score DESC", conn)
+
+    def load_intraday_logs(self) -> pd.DataFrame:
+        with self._connect() as conn:
+            return pd.read_sql_query("SELECT * FROM intraday_scan_logs ORDER BY id DESC LIMIT 500", conn)
+
+    def add_intraday_watch(
+        self,
+        ticker: str,
+        signal: str = None,
+        entry_price: float = None,
+        target_price: float = None,
+        stop_price: float = None,
+        notes: str = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO intraday_watchlist (ticker, signal, entry_price, target_price, stop_price, notes)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (ticker, signal, entry_price, target_price, stop_price, notes),
+            )
+
+    def close_intraday_watch(self, watch_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE intraday_watchlist SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (watch_id,),
+            )
+
+    def load_intraday_watchlist(self) -> pd.DataFrame:
+        with self._connect() as conn:
+            return pd.read_sql_query("SELECT * FROM intraday_watchlist ORDER BY id DESC", conn)
 
     def _read_latest(self, table: str, order_by: str) -> pd.DataFrame:
         with self._connect() as conn:

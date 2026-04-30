@@ -11,11 +11,12 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 from options_screening.config import get_settings
+from options_screening.intraday import IntradayScanRequest, run_intraday_scan
 from options_screening.market_hours import is_regular_market_hours
 from options_screening.refresh import format_refresh_interval, refresh_interval_to_ms
 from options_screening.scanner import ScanRequest, run_scan
 from options_screening.storage import Storage
-from options_screening.universe import load_sp500_tickers
+from options_screening.universe import load_sp100_tickers, load_sp500_tickers
 
 
 st.set_page_config(page_title="Options Screener", layout="wide")
@@ -43,6 +44,17 @@ DEFAULT_PREFERENCES = {
     "auto_refresh_enabled": False,
     "refresh_unit": "minutes",
     "refresh_interval": 15,
+    "intraday_mode": "Both",
+    "intraday_universe": "S&P 100",
+    "intraday_custom_tickers": "",
+    "intraday_min_price": 5.0,
+    "intraday_max_price": 1000.0,
+    "intraday_min_relative_volume": 0.05,
+    "intraday_min_day_change_pct": 0.5,
+    "intraday_max_spread_pct": 1.0,
+    "intraday_include_shorts": True,
+    "intraday_auto_refresh_enabled": False,
+    "intraday_refresh_interval": 15,
 }
 RESULT_COLUMN_GUIDE = [
     ("rank", "Position after sorting by total score. 1 is the highest-ranked contract in the latest scan.", "1"),
@@ -99,6 +111,12 @@ def _init_state(preferences: dict) -> None:
         st.session_state.last_auto_refresh_count = None
     if "last_auto_refresh_key" not in st.session_state:
         st.session_state.last_auto_refresh_key = None
+    if "intraday_last_scan_at" not in st.session_state:
+        st.session_state.intraday_last_scan_at = None
+    if "intraday_auto_refresh" not in st.session_state:
+        st.session_state.intraday_auto_refresh = bool(preferences["intraday_auto_refresh_enabled"])
+    if "intraday_last_auto_refresh_count" not in st.session_state:
+        st.session_state.intraday_last_auto_refresh_count = None
 
 
 def _render_metric_row(df: pd.DataFrame) -> None:
@@ -209,6 +227,266 @@ def _filter_by_signal(df: pd.DataFrame, selected_signals) -> pd.DataFrame:
     if df.empty or not selected_signals or "trade_signal" not in df.columns:
         return df
     return df[df["trade_signal"].isin(selected_signals)].copy()
+
+
+def _render_intraday_table(df: pd.DataFrame) -> None:
+    columns = [
+        "rank",
+        "ticker",
+        "last_price",
+        "day_change_pct",
+        "volume",
+        "relative_volume",
+        "open",
+        "high",
+        "low",
+        "prev_close",
+        "minute_price",
+        "spread_pct",
+        "signal_mode",
+        "momentum_score",
+        "mean_reversion_score",
+        "total_score",
+        "trade_signal",
+        "signal_reason",
+        "risk_notes",
+        "as_of",
+    ]
+    available = [col for col in columns if col in df.columns]
+    st.dataframe(df[available].copy() if not df.empty else df, use_container_width=True, hide_index=True)
+
+
+def _filter_intraday_results(df: pd.DataFrame, tickers, signals, modes, min_score: float) -> pd.DataFrame:
+    if df.empty:
+        return df
+    filtered = df.copy()
+    if tickers and "ticker" in filtered.columns:
+        filtered = filtered[filtered["ticker"].isin(tickers)]
+    if signals and "trade_signal" in filtered.columns:
+        filtered = filtered[filtered["trade_signal"].isin(signals)]
+    if modes and "signal_mode" in filtered.columns:
+        filtered = filtered[filtered["signal_mode"].isin(modes)]
+    if "total_score" in filtered.columns:
+        filtered = filtered[filtered["total_score"].fillna(0) >= min_score]
+    return filtered
+
+
+def _render_intraday_watchlist(storage: Storage, latest: pd.DataFrame) -> None:
+    st.subheader("Intraday Watchlist")
+    watchlist = storage.load_intraday_watchlist()
+    if latest.empty:
+        st.info("Run an intraday scan first, then add stocks to the watchlist.")
+    else:
+        choices = latest["ticker"].dropna().tolist()
+        with st.form("add_intraday_watch"):
+            ticker = st.selectbox("Ticker", choices)
+            selected_row = latest[latest["ticker"] == ticker].iloc[0]
+            col1, col2, col3 = st.columns(3)
+            entry_price = col1.number_input("Entry price", min_value=0.0, value=float(selected_row.get("last_price") or 0.0), step=0.01)
+            target_price = col2.number_input("Target price", min_value=0.0, value=0.0, step=0.01)
+            stop_price = col3.number_input("Stop price", min_value=0.0, value=0.0, step=0.01)
+            notes = st.text_area("Notes")
+            submitted = st.form_submit_button("Add to Intraday Watchlist")
+            if submitted:
+                storage.add_intraday_watch(
+                    ticker=ticker,
+                    signal=selected_row.get("trade_signal"),
+                    entry_price=float(entry_price) if entry_price else None,
+                    target_price=float(target_price) if target_price else None,
+                    stop_price=float(stop_price) if stop_price else None,
+                    notes=notes,
+                )
+                st.success("Added to intraday watchlist.")
+                st.rerun()
+
+    if watchlist.empty:
+        st.dataframe(watchlist, use_container_width=True, hide_index=True)
+        return
+
+    st.dataframe(watchlist, use_container_width=True, hide_index=True)
+    open_ids = watchlist[watchlist["status"] == "watching"]["id"].tolist()
+    if open_ids:
+        close_id = st.selectbox("Close intraday watch item", open_ids)
+        if st.button("Mark Intraday Item Closed"):
+            storage.close_intraday_watch(int(close_id))
+            st.success("Intraday watch item closed.")
+            st.rerun()
+
+
+def _render_intraday_page(settings, storage: Storage, preferences: dict) -> None:
+    st.title("Intraday Stock Screener")
+    st.caption("Decision-support screener for intraday S&P 100 or custom stock ideas. No broker execution.")
+
+    with st.sidebar:
+        st.header("Intraday Settings")
+        key_status = "Loaded" if settings.polygon_api_key else "Missing"
+        st.metric("Polygon API Key", key_status)
+        mode_options = ["Both", "Momentum", "Mean Reversion"]
+        intraday_mode = st.selectbox(
+            "Signal mode",
+            mode_options,
+            index=mode_options.index(preferences["intraday_mode"]) if preferences["intraday_mode"] in mode_options else 0,
+        )
+        universe_options = ["S&P 100", "Custom"]
+        intraday_universe = st.radio(
+            "Universe",
+            universe_options,
+            index=universe_options.index(preferences["intraday_universe"]) if preferences["intraday_universe"] in universe_options else 0,
+            horizontal=True,
+        )
+        intraday_custom_tickers = st.text_area(
+            "Custom tickers",
+            value=str(preferences["intraday_custom_tickers"]),
+            placeholder="AAPL, MSFT, NVDA, SPY, QQQ",
+            disabled=intraday_universe != "Custom",
+        )
+        min_price = st.number_input("Min price", min_value=0.0, max_value=10000.0, value=_bounded_number(preferences["intraday_min_price"], 0.0, 10000.0, 5.0), step=1.0)
+        max_price = st.number_input("Max price", min_value=1.0, max_value=10000.0, value=_bounded_number(preferences["intraday_max_price"], 1.0, 10000.0, 1000.0), step=5.0)
+        min_relative_volume = st.number_input("Min relative volume", min_value=0.0, max_value=10.0, value=_bounded_number(preferences["intraday_min_relative_volume"], 0.0, 10.0, 0.05), step=0.01)
+        min_day_change_pct = st.number_input("Min day change %", min_value=0.0, max_value=20.0, value=_bounded_number(preferences["intraday_min_day_change_pct"], 0.0, 20.0, 0.5), step=0.1)
+        max_spread_pct = st.number_input("Max spread %", min_value=0.01, max_value=20.0, value=_bounded_number(preferences["intraday_max_spread_pct"], 0.01, 20.0, 1.0), step=0.1)
+        include_shorts = st.checkbox("Include short candidates", value=bool(preferences["intraday_include_shorts"]))
+        st.subheader("Auto Refresh")
+        st.session_state.intraday_auto_refresh = st.checkbox(
+            "Auto-refresh during market hours",
+            value=st.session_state.intraday_auto_refresh,
+            key="intraday_auto_refresh_checkbox",
+        )
+        intraday_refresh_interval = st.number_input(
+            "Refresh every minutes",
+            min_value=1,
+            max_value=1440,
+            value=_bounded_number(preferences["intraday_refresh_interval"], 1, 1440, 15),
+            step=1,
+            disabled=not st.session_state.intraday_auto_refresh,
+        )
+
+    if intraday_universe == "Custom":
+        selected_tickers = _parse_custom_tickers(intraday_custom_tickers)
+        if not selected_tickers:
+            st.warning("Add at least one custom ticker to run a custom intraday scan.")
+    else:
+        selected_tickers, universe_note = load_sp100_tickers()
+        if universe_note:
+            st.warning(universe_note)
+
+    try:
+        _save_app_preferences(
+            {
+                **preferences,
+                "intraday_mode": intraday_mode,
+                "intraday_universe": intraday_universe,
+                "intraday_custom_tickers": intraday_custom_tickers,
+                "intraday_min_price": float(min_price),
+                "intraday_max_price": float(max_price),
+                "intraday_min_relative_volume": float(min_relative_volume),
+                "intraday_min_day_change_pct": float(min_day_change_pct),
+                "intraday_max_spread_pct": float(max_spread_pct),
+                "intraday_include_shorts": bool(include_shorts),
+                "intraday_auto_refresh_enabled": bool(st.session_state.intraday_auto_refresh),
+                "intraday_refresh_interval": int(intraday_refresh_interval),
+            }
+        )
+    except OSError as exc:
+        st.warning(f"Could not save intraday settings: {exc}")
+
+    if not settings.polygon_api_key:
+        st.error("Add POLYGON_API_KEY to .env, then restart Streamlit or rerun the app.")
+
+    request = IntradayScanRequest(
+        tickers=selected_tickers,
+        mode=intraday_mode,
+        min_price=float(min_price),
+        max_price=float(max_price),
+        min_relative_volume=float(min_relative_volume),
+        min_day_change_pct=float(min_day_change_pct),
+        max_spread_pct=float(max_spread_pct),
+        include_shorts=bool(include_shorts),
+    )
+
+    run_col, info_col = st.columns([1, 4])
+    with run_col:
+        run_now = st.button("Run Intraday Scan", type="primary", disabled=not bool(settings.polygon_api_key) or not selected_tickers)
+    with info_col:
+        st.write(f"Universe: {intraday_universe}, {len(selected_tickers)} tickers. Refresh target: {int(intraday_refresh_interval)} minutes.")
+
+    auto_count = None
+    if st.session_state.intraday_auto_refresh:
+        auto_count = st_autorefresh(interval=int(intraday_refresh_interval) * 60 * 1000, key="intraday_auto_refresh_counter")
+        if not is_regular_market_hours():
+            st.info("Intraday auto-refresh is enabled and waiting for regular US market hours.")
+
+    auto_due = (
+        st.session_state.intraday_auto_refresh
+        and bool(settings.polygon_api_key)
+        and bool(selected_tickers)
+        and is_regular_market_hours()
+        and auto_count is not None
+        and auto_count != st.session_state.intraday_last_auto_refresh_count
+    )
+
+    if run_now or auto_due:
+        with st.spinner("Scanning intraday stock snapshots..."):
+            results, summary, logs = run_intraday_scan(settings, request)
+            storage.save_intraday_scan(results, logs)
+        st.session_state.intraday_last_scan_at = datetime.now(EASTERN_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+        if auto_due:
+            st.session_state.intraday_last_auto_refresh_count = auto_count
+        st.success(
+            f"Intraday scan complete: {summary.accepted} candidates, {summary.watch} watch, "
+            f"{summary.avoid} avoid, {summary.errors} errors."
+        )
+
+    latest = _format_time_columns(storage.load_intraday_results(), ["as_of"])
+    logs = _format_time_columns(storage.load_intraday_logs(), ["created_at"])
+
+    tab_results, tab_logs, tab_watchlist, tab_settings = st.tabs(["Results", "Scan Logs", "Watchlist", "Settings"])
+    with tab_results:
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Rows", len(latest))
+        col2.metric("Tickers", latest["ticker"].nunique() if not latest.empty else 0)
+        col3.metric("Avg Score", f"{latest['total_score'].mean():.1f}" if not latest.empty else "0.0")
+        col4.metric("Last Scan", st.session_state.intraday_last_scan_at or "Not run")
+        filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([2, 2, 2, 1])
+        tickers_filter = filter_col1.multiselect(
+            "Filter ticker",
+            sorted(latest["ticker"].dropna().unique().tolist()) if not latest.empty else [],
+            default=[],
+            placeholder="All tickers",
+        )
+        signals_filter = filter_col2.multiselect(
+            "Filter signal",
+            sorted(latest["trade_signal"].dropna().unique().tolist()) if not latest.empty else [],
+            default=[],
+            placeholder="All signals",
+        )
+        modes_filter = filter_col3.multiselect(
+            "Filter mode",
+            sorted(latest["signal_mode"].dropna().unique().tolist()) if not latest.empty else [],
+            default=[],
+            placeholder="All modes",
+        )
+        min_score_filter = filter_col4.number_input("Min score", min_value=0.0, max_value=100.0, value=0.0, step=5.0)
+        filtered = _filter_intraday_results(latest, tickers_filter, signals_filter, modes_filter, float(min_score_filter))
+        _render_intraday_table(filtered)
+        if not filtered.empty:
+            st.download_button("Export Intraday CSV", filtered.to_csv(index=False), "intraday_results.csv", "text/csv")
+
+    with tab_logs:
+        st.dataframe(logs, use_container_width=True, hide_index=True)
+
+    with tab_watchlist:
+        _render_intraday_watchlist(storage, latest)
+
+    with tab_settings:
+        st.json(
+            {
+                **request.model_dump(),
+                "auto_refresh_enabled": st.session_state.intraday_auto_refresh,
+                "refresh_interval_minutes": int(intraday_refresh_interval),
+            }
+        )
+        st.caption("Signals are screening labels only. Verify chart, spread, liquidity, and risk before any trade.")
 
 
 def _render_watchlist(storage: Storage, latest: pd.DataFrame) -> None:
@@ -349,6 +627,12 @@ def main() -> None:
     settings = get_settings()
     storage = Storage(settings.db_path)
     storage.initialize()
+
+    with st.sidebar:
+        page = st.radio("Page", ["Options Scanner", "Intraday Stocks"], horizontal=True)
+    if page == "Intraday Stocks":
+        _render_intraday_page(settings, storage, preferences)
+        return
 
     st.title("Local Options Screening Dashboard")
     st.caption("Decision-support screener for conservative swing-trade call and put ideas. No broker execution.")

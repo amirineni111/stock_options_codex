@@ -70,6 +70,27 @@ class PolygonClient:
                 return float(value)
         return None
 
+    def get_stock_snapshots(self, tickers: List[str]) -> List[Dict[str, Any]]:
+        if not tickers:
+            return []
+        try:
+            payload = self._get(
+                "/v2/snapshot/locale/us/markets/stocks/tickers",
+                {"tickers": ",".join(t.upper() for t in tickers), "include_otc": "false"},
+            )
+            return payload.get("tickers") or []
+        except RuntimeError as exc:
+            if "Polygon API error 403" not in str(exc):
+                raise
+
+        snapshots = []
+        for ticker in tickers:
+            payload = self._get(f"/v2/snapshot/locale/us/markets/stocks/tickers/{ticker.upper()}")
+            ticker_data = payload.get("ticker")
+            if ticker_data:
+                snapshots.append(ticker_data)
+        return snapshots
+
     def get_market_context(
         self,
         ticker: str,
