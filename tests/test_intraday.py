@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import app
@@ -31,6 +32,27 @@ def _snapshot(**overrides):
 
 def test_parse_custom_tickers_dedupes_and_uppercases():
     assert app._parse_custom_tickers("aapl, msft\nspy, AAPL") == ["AAPL", "MSFT", "SPY"]
+
+
+def test_preference_load_keeps_custom_ticker_lists_separate(tmp_path, monkeypatch):
+    preferences_path = Path(tmp_path) / "app_preferences.json"
+    preferences_path.write_text(
+        json.dumps(
+            {
+                "ticker_source": "Custom",
+                "custom_tickers": "AAPL, MSFT",
+                "intraday_universe": "Custom",
+                "intraday_custom_tickers": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(app, "APP_PREFERENCES_PATH", preferences_path)
+
+    preferences = app._load_app_preferences()
+
+    assert preferences["custom_tickers"] == "AAPL, MSFT"
+    assert preferences["intraday_custom_tickers"] == ""
 
 
 def test_sp100_universe_available():

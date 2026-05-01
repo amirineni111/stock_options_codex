@@ -380,6 +380,7 @@ def _render_intraday_page(settings, storage: Storage, preferences: dict) -> None
             value=str(preferences["intraday_custom_tickers"]),
             placeholder="AAPL, MSFT, NVDA, SPY, QQQ",
             disabled=intraday_universe != "Custom",
+            key="intraday_custom_tickers_input",
         )
         min_price = st.number_input("Min price", min_value=0.0, max_value=10000.0, value=_bounded_number(preferences["intraday_min_price"], 0.0, 10000.0, 5.0), step=1.0)
         max_price = st.number_input("Max price", min_value=1.0, max_value=10000.0, value=_bounded_number(preferences["intraday_max_price"], 1.0, 10000.0, 1000.0), step=5.0)
@@ -416,7 +417,6 @@ def _render_intraday_page(settings, storage: Storage, preferences: dict) -> None
     try:
         _save_app_preferences(
             {
-                **preferences,
                 "intraday_mode": intraday_mode,
                 "intraday_universe": intraday_universe,
                 "intraday_custom_tickers": intraday_custom_tickers,
@@ -611,8 +611,6 @@ def _load_app_preferences() -> dict:
         return preferences
     if isinstance(saved, dict):
         preferences.update(saved)
-    if preferences.get("intraday_universe") == "Custom" and not str(preferences.get("intraday_custom_tickers") or "").strip():
-        preferences["intraday_custom_tickers"] = str(preferences.get("custom_tickers") or "")
     return preferences
 
 
@@ -731,6 +729,7 @@ def main() -> None:
             value=str(preferences["custom_tickers"]),
             placeholder="AAPL, MSFT, NVDA, SPY, QQQ",
             disabled=ticker_source != "Custom",
+            key="options_custom_tickers_input",
         )
         if ticker_source == "Custom":
             parsed_custom_tickers = _parse_custom_tickers(custom_tickers)
