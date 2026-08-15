@@ -17,6 +17,7 @@ from options_screening.market_hours import (
 from options_screening.refresh import format_refresh_interval, refresh_interval_to_ms
 from options_screening.scanner import ScanRequest, run_scan
 from options_screening.storage import Storage
+from options_screening.ui_panels import render_model_tab, render_performance_tab
 from options_screening.universe import load_sp100_tickers, load_sp500_tickers
 
 
@@ -107,6 +108,22 @@ RESULT_COLUMN_GUIDE = [
     ("score_iv", "Score for IV within your selected IV range. Lower IV in range scores better. Max is 15.", "14.15"),
     ("reason", "Why the contract was accepted, including warnings such as missing bid/ask spread.", "Accepted...verify quote"),
     ("as_of", "When the option snapshot was parsed, shown in Eastern Time.", "2026-04-27 10:22:26 EDT"),
+    ("premium_entry", "Entry premium per share: the current mid. One contract costs this times 100.", "4.00 = $400"),
+    ("premium_stop", "Premium the position is worth if the underlying reaches its stop, decay included. Floored so a bracket never implies losing the whole premium.", "1.60"),
+    ("premium_target", "Premium if the underlying reaches its target, decay included.", "13.42"),
+    ("premium_rr", "Reward:risk in PREMIUM terms. Not the underlying's 1.5 - delta, gamma and decay all bend it, and on a low-delta contract they bend it a long way.", "3.93"),
+    ("risk_dollars", "Dollars at risk per contract if the stop is reached.", "240.00"),
+    ("reward_dollars", "Dollars gained per contract if the target is reached.", "942.20"),
+    ("underlying_stop", "Underlying price that triggers the exit. The position is exited on the stock, but the P&L is in premium, so both are shown.", "114.00"),
+    ("underlying_target", "Underlying price at the profit target.", "139.00"),
+    ("theta_per_premium", "Daily decay as a fraction of the premium paid - the rate that actually kills a long option. 0.0125 means it loses 1.25% of value per day if nothing moves.", "0.0125"),
+    ("decay_at_target", "Dollars per contract time decay will consume over the expected hold. Negative, because it is a cost.", "-70.30"),
+    ("target_hold_days", "How long the target move plausibly takes, from the underlying's own volatility. Scales with the SQUARE of distance in ATRs, because a random walk covers N x ATR in about N-squared days.", "14.06"),
+    ("iv_rank", "Where today's IV sits in this underlying's own recent range, 0 to 1. An absolute IV means nothing alone: 45% is cheap for one name and expensive for another.", "0.58"),
+    ("gamma_leverage", "How fast delta accelerates, scaled to compare across names. High is cheap convexity - and fast decay, which is why it sits beside theta_per_premium.", "0.0115"),
+    ("underlying_atr14", "14-day ATR of the underlying. The unit the stop distance is quoted in.", "4.00"),
+    ("model_prob", "The trained model's P(target before stop), when one is serving. It can only veto, never promote.", "0.47"),
+    ("required_prob", "Cost-adjusted breakeven win rate plus a margin. Below this, an otherwise-actionable contract is downgraded.", "0.44"),
 ]
 INTRADAY_COLUMN_GUIDE = [
     ("trade_signal", "The decision. STRONG_BUY / STRONG_SHORT need a 70+ score and higher-timeframe confirmation; BUY_CANDIDATE / SHORT_CANDIDATE need 45+; WATCH_ONLY is a setup a veto downgraded; AVOID is unusable.", "A veto always downgrades rather than hides, so the reason stays visible."),
@@ -186,6 +203,24 @@ def _format_results(df: pd.DataFrame) -> pd.DataFrame:
         "breakeven",
         "trade_signal",
         "signal_reason",
+        # The premium bracket and the greeks-derived columns, next to the decision
+        # they inform rather than at the far right of a 50-column table.
+        "premium_entry",
+        "premium_stop",
+        "premium_target",
+        "premium_rr",
+        "risk_dollars",
+        "reward_dollars",
+        "underlying_stop",
+        "underlying_target",
+        "theta_per_premium",
+        "decay_at_target",
+        "target_hold_days",
+        "iv_rank",
+        "gamma_leverage",
+        "underlying_atr14",
+        "model_prob",
+        "required_prob",
         "decision_checklist",
         "trend_signal",
         "trend_aligned",
@@ -561,7 +596,9 @@ def _render_intraday_page(settings, storage: Storage, preferences: dict) -> None
 
     if run_now or auto_due:
         with st.spinner("Scanning intraday stock snapshots..."):
-            results, summary, logs = run_intraday_scan(settings, request)
+            # Passing storage turns the scan into the full loop: open forward tests
+            # are resolved against the fresh bars and new signals are armed.
+            results, summary, logs = run_intraday_scan(settings, request, storage=storage)
             storage.save_intraday_scan(results, logs)
         st.session_state.intraday_last_scan_at = datetime.now(EASTERN_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
         if auto_due:
@@ -574,7 +611,18 @@ def _render_intraday_page(settings, storage: Storage, preferences: dict) -> None
     latest = _format_time_columns(storage.load_intraday_results(), ["as_of"])
     logs = _format_time_columns(storage.load_intraday_logs(), ["created_at"])
 
-    tab_results, tab_logs, tab_watchlist, tab_settings = st.tabs(["Results", "Scan Logs", "Watchlist", "Settings"])
+    (
+        tab_results,
+        tab_performance,
+        tab_model,
+        tab_logs,
+        tab_watchlist,
+        tab_settings,
+    ) = st.tabs(["Results", "Performance", "Model", "Scan Logs", "Watchlist", "Settings"])
+    with tab_performance:
+        render_performance_tab(storage, "intraday")
+    with tab_model:
+        render_model_tab(storage, "intraday")
     with tab_results:
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Rows", len(latest))
@@ -882,7 +930,35 @@ def main() -> None:
     if not settings.polygon_api_key:
         st.error("Add POLYGON_API_KEY to .env, then restart Streamlit or rerun the app.")
 
-    tabs = st.tabs(["Ranked Calls", "Ranked Puts", "Ticker Detail", "Rejected", "Scan Logs", "Watchlist", "Settings"])
+    # Named rather than indexed: the positional form silently shifted every later tab
+    # when two were inserted in the middle.
+    (
+        tab_calls,
+        tab_puts,
+        tab_detail,
+        tab_performance,
+        tab_model,
+        tab_rejected,
+        tab_logs,
+        tab_watchlist,
+        tab_settings,
+    ) = st.tabs(
+        [
+            "Ranked Calls",
+            "Ranked Puts",
+            "Ticker Detail",
+            "Performance",
+            "Model",
+            "Rejected",
+            "Scan Logs",
+            "Watchlist",
+            "Settings",
+        ]
+    )
+    with tab_performance:
+        render_performance_tab(storage, "options")
+    with tab_model:
+        render_model_tab(storage, "options")
 
     scan_request = ScanRequest(
         tickers=selected_tickers,
@@ -949,7 +1025,7 @@ def main() -> None:
     calls = latest[latest["contract_type"] == "call"].copy() if not latest.empty else latest
     puts = latest[latest["contract_type"] == "put"].copy() if not latest.empty else latest
 
-    with tabs[0]:
+    with tab_calls:
         call_underlyings = _render_underlying_filter(calls, "calls_underlying_filter")
         call_signals = _render_signal_filter(calls, "calls_signal_filter")
         filtered_calls = _filter_by_signal(_filter_by_underlying(calls, call_underlyings), call_signals)
@@ -958,7 +1034,7 @@ def main() -> None:
         if not filtered_calls.empty:
             st.download_button("Export Calls CSV", filtered_calls.to_csv(index=False), "ranked_calls.csv", "text/csv")
 
-    with tabs[1]:
+    with tab_puts:
         put_underlyings = _render_underlying_filter(puts, "puts_underlying_filter")
         put_signals = _render_signal_filter(puts, "puts_signal_filter")
         filtered_puts = _filter_by_signal(_filter_by_underlying(puts, put_underlyings), put_signals)
@@ -967,23 +1043,23 @@ def main() -> None:
         if not filtered_puts.empty:
             st.download_button("Export Puts CSV", filtered_puts.to_csv(index=False), "ranked_puts.csv", "text/csv")
 
-    with tabs[2]:
+    with tab_detail:
         detail_tickers = sorted(latest["underlying"].dropna().unique().tolist()) if not latest.empty else selected_tickers
         ticker = st.selectbox("Ticker", detail_tickers)
         detail = latest[latest["underlying"] == ticker].copy() if not latest.empty else latest
         _render_results_table(detail)
 
-    with tabs[3]:
+    with tab_rejected:
         rejected_underlyings = _render_underlying_filter(rejected, "rejected_underlying_filter")
         st.dataframe(_filter_by_underlying(rejected, rejected_underlyings), use_container_width=True, hide_index=True)
 
-    with tabs[4]:
+    with tab_logs:
         st.dataframe(logs, use_container_width=True, hide_index=True)
 
-    with tabs[5]:
+    with tab_watchlist:
         _render_watchlist(storage, latest)
 
-    with tabs[6]:
+    with tab_settings:
         st.json(
             {
                 **scan_request.model_dump(),
