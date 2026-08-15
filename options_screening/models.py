@@ -94,6 +94,28 @@ class ScoredContract(BaseModel):
     trade_signal: Optional[str] = None
     signal_reason: Optional[str] = None
 
+    # ── Greeks-derived, and the premium bracket ──────────────────────────────
+    days_to_expiration: Optional[int] = None
+    underlying_atr14: Optional[float] = None
+    theta_per_premium: Optional[float] = None
+    gamma_leverage: Optional[float] = None
+    iv_rank: Optional[float] = None
+    premium_entry: Optional[float] = None
+    premium_stop: Optional[float] = None
+    premium_target: Optional[float] = None
+    underlying_stop: Optional[float] = None
+    underlying_target: Optional[float] = None
+    risk_dollars: Optional[float] = None
+    reward_dollars: Optional[float] = None
+    premium_rr: Optional[float] = None
+    target_hold_days: Optional[float] = None
+    decay_at_target: Optional[float] = None
+    # Populated when a trained model is serving; a veto only, never a promoter.
+    model_prob: Optional[float] = None
+    required_prob: Optional[float] = None
+
+    model_config = {"protected_namespaces": ()}
+
 
 class MarketContext(BaseModel):
     underlying: str

@@ -10,10 +10,19 @@ promote something the filters already rejected.
 from __future__ import annotations
 
 from datetime import date
-import math
 from typing import List, Optional, Tuple
 
+from .greeks import (
+    expected_move_pct,
+    gamma_leverage,
+    iv_rank,
+    premium_trade_levels,
+    project_premium,
+    theta_per_premium,
+)
+from .indicators import calculate_atr
 from .models import MarketContext, OptionContract, RejectedContract, ScoredContract
+from .signals import _RR, _STOP_ATR_MULT
 from .timeutil import exchange_date
 
 # ── Score component weights ──────────────────────────────────────────────────
@@ -45,6 +54,19 @@ _SIGNAL_MIN_OPEN_INTEREST = 100
 # The +/- move used for the scenario P&L columns.
 _SCENARIO_MOVE_PCT = 0.02
 
+# Downgrade when decay eats more than this share of the premium before the target can
+# plausibly be reached. At a third, the underlying has to cover the thesis *and* a
+# third of the premium just to break even — which is a volatility bet wearing a
+# directional costume.
+_MAX_DECAY_SHARE = 0.33
+
+# IV shift assumed in the adverse scenario, in vol points. A move against a long
+# option is very often accompanied by IV *rising* for puts and falling for calls, but
+# modelling that asymmetry needs a skew surface this repo does not have. Zero is the
+# honest placeholder; the vega column exposes the sensitivity so the reader can apply
+# their own view.
+_SCENARIO_IV_CHANGE = 0.0
+
 
 def days_to_expiration(contract: OptionContract, today: Optional[date] = None) -> int:
     """
@@ -63,8 +85,15 @@ def score_contract(
     settings,
     market_context: Optional[MarketContext] = None,
     today: Optional[date] = None,
+    iv_history: Optional[List[float]] = None,
 ) -> Tuple[Optional[ScoredContract], Optional[RejectedContract]]:
-    """Returns exactly one of (scored, None) or (None, rejection)."""
+    """
+    Returns exactly one of (scored, None) or (None, rejection).
+
+    ``iv_history`` is this underlying's recent implied-volatility observations, used
+    for the IV rank. It is passed in rather than fetched so this stays a pure function
+    of its inputs.
+    """
     today = today or exchange_date()
     rejection = _validate_contract(contract, settings, market_context, today=today)
     if rejection:
@@ -113,7 +142,14 @@ def score_contract(
         breakeven = contract.strike_price - mid
 
     decision_context = _decision_context(
-        contract, settings, market_context, breakeven, max_contracts, premium_at_risk, today=today
+        contract,
+        settings,
+        market_context,
+        breakeven,
+        max_contracts,
+        premium_at_risk,
+        today=today,
+        iv_history=iv_history,
     )
 
     result = ScoredContract(
@@ -140,6 +176,7 @@ def score_contracts(
     settings,
     market_context: Optional[MarketContext] = None,
     today: Optional[date] = None,
+    iv_history: Optional[List[float]] = None,
 ) -> Tuple[List[ScoredContract], List[RejectedContract]]:
     # Resolved once for the whole batch, so a scan that straddles midnight ET cannot
     # score its first ticker against a different DTE than its last.
@@ -147,7 +184,9 @@ def score_contracts(
     accepted: List[ScoredContract] = []
     rejected: List[RejectedContract] = []
     for contract in contracts:
-        scored, rejection = score_contract(contract, settings, market_context, today=today)
+        scored, rejection = score_contract(
+            contract, settings, market_context, today=today, iv_history=iv_history
+        )
         if scored:
             accepted.append(scored)
         elif rejection:
@@ -226,21 +265,30 @@ def _decision_context(
     max_contracts: int,
     premium_at_risk: float,
     today: Optional[date] = None,
+    iv_history: Optional[List[float]] = None,
 ) -> dict:
     underlying_price = _underlying_price(contract, market_context)
     dte = days_to_expiration(contract, today)
     iv = contract.implied_volatility or 0.0
-    expected_move_pct = round(iv * math.sqrt(max(dte, 0) / 365.0) * 100, 2) if iv and dte > 0 else None
+    move_pct = expected_move_pct(iv, dte)
     breakeven_distance_pct = _breakeven_distance_pct(contract, breakeven, underlying_price)
     expected_move_ok = None
-    if expected_move_pct is not None and breakeven_distance_pct is not None:
-        expected_move_ok = breakeven_distance_pct <= expected_move_pct
+    if move_pct is not None and breakeven_distance_pct is not None:
+        expected_move_ok = breakeven_distance_pct <= move_pct
 
+    # The underlying's own volatility, used both to size the bracket and to convert a
+    # price distance into a plausible holding period for the decay charge.
+    daily_atr = _daily_atr(market_context)
+    levels = _premium_bracket(contract, underlying_price, daily_atr, dte)
+
+    # Scenarios are charged decay for the time the move is assumed to take, rather
+    # than being quoted as instantaneous.
+    hold_days = levels.get("target_hold_days") or 0.0
     favorable_value, favorable_pnl = _scenario_value(
-        contract, underlying_price, max_contracts, premium_at_risk, _SCENARIO_MOVE_PCT
+        contract, underlying_price, max_contracts, premium_at_risk, _SCENARIO_MOVE_PCT, hold_days
     )
     adverse_value, adverse_pnl = _scenario_value(
-        contract, underlying_price, max_contracts, premium_at_risk, -_SCENARIO_MOVE_PCT
+        contract, underlying_price, max_contracts, premium_at_risk, -_SCENARIO_MOVE_PCT, hold_days
     )
     trend_aligned = _trend_aligned(contract, market_context) if market_context else None
 
@@ -253,15 +301,72 @@ def _decision_context(
         "earnings_date": market_context.earnings_date if market_context else None,
         "earnings_warning": market_context.earnings_warning if market_context else "not checked",
         "breakeven_distance_pct": breakeven_distance_pct,
-        "expected_move_pct": expected_move_pct,
+        "expected_move_pct": move_pct,
         "expected_move_to_breakeven_ok": expected_move_ok,
         "favorable_2pct_value": favorable_value,
         "favorable_2pct_pnl": favorable_pnl,
         "adverse_2pct_value": adverse_value,
         "adverse_2pct_pnl": adverse_pnl,
+        "days_to_expiration": dte,
+        "underlying_atr14": _round_optional(daily_atr),
+        # Greeks that were fetched and stored but never read by anything until now.
+        "theta_per_premium": theta_per_premium(contract),
+        "gamma_leverage": gamma_leverage(contract, underlying_price),
+        "iv_rank": iv_rank(contract.implied_volatility, iv_history or []),
+        "premium_entry": levels.get("premium_entry"),
+        "premium_stop": levels.get("premium_stop"),
+        "premium_target": levels.get("premium_target"),
+        "underlying_stop": levels.get("underlying_stop"),
+        "underlying_target": levels.get("underlying_target"),
+        "risk_dollars": levels.get("risk_dollars"),
+        "reward_dollars": levels.get("reward_dollars"),
+        "premium_rr": levels.get("premium_rr"),
+        "target_hold_days": levels.get("target_hold_days"),
+        "decay_at_target": levels.get("decay_at_target"),
         "decision_checklist": _decision_checklist(contract, trend_aligned, expected_move_ok, market_context),
-        **_trade_signal(contract, settings, market_context, trend_aligned, expected_move_ok),
+        **_trade_signal(contract, settings, market_context, trend_aligned, expected_move_ok, levels),
     }
+
+
+def _daily_atr(market_context: Optional[MarketContext]) -> Optional[float]:
+    """ATR(14) from the daily bars carried on the market context, if they are there."""
+    if not market_context or not market_context.daily_bars:
+        return None
+    bars = market_context.daily_bars
+    highs = [b.get("high") for b in bars]
+    lows = [b.get("low") for b in bars]
+    closes = [b.get("close") for b in bars]
+    if any(v is None for v in highs + lows + closes):
+        return None
+    return calculate_atr(highs, lows, closes)
+
+
+def _premium_bracket(
+    contract: OptionContract,
+    underlying_price: Optional[float],
+    daily_atr: Optional[float],
+    dte: int,
+) -> dict:
+    """
+    The underlying's ATR bracket expressed in premium terms.
+
+    Uses the same geometry as the equity lane — a 2.5x ATR stop and a 1.5R target — so
+    a stop means the same thing on both pages. What differs is that the *premium*
+    reward:risk is not 1.5: delta, gamma and decay all bend it, and on a low-delta
+    contract they bend it a long way. That number is surfaced as ``premium_rr``
+    rather than assumed.
+    """
+    if not daily_atr or not underlying_price:
+        return {}
+    stop_distance = _STOP_ATR_MULT * daily_atr
+    return premium_trade_levels(
+        contract,
+        underlying_price=underlying_price,
+        underlying_stop_distance=stop_distance,
+        underlying_target_distance=_RR * stop_distance,
+        daily_atr=daily_atr,
+        dte=dte,
+    )
 
 
 def _underlying_price(contract: OptionContract, market_context: Optional[MarketContext]) -> Optional[float]:
@@ -290,17 +395,31 @@ def _scenario_value(
     max_contracts: int,
     premium_at_risk: float,
     move_pct: float,
+    holding_days: float = 0.0,
 ) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Position value after a ``move_pct`` move in the position's favour (or against it,
+    for a negative value), ``holding_days`` later.
+
+    ``move_pct`` is expressed in the *option's* favour, so the sign is flipped for a
+    put before being handed to the underlying-frame projection.
+
+    This used to be delta + gamma only, with no time term at all — which for a
+    21-75 DTE hold omits what is usually the largest component of the P&L and made
+    every favourable scenario read better than it is.
+    """
     if underlying_price is None or underlying_price <= 0 or max_contracts <= 0 or contract.mid_price is None:
         return None, None
-    signed_move_pct = move_pct
-    if contract.contract_type == "put":
-        signed_move_pct = -move_pct
-    underlying_move = underlying_price * signed_move_pct
-    delta = contract.delta or 0.0
-    gamma = contract.gamma or 0.0
-    estimated_option_price = max(0.0, contract.mid_price + delta * underlying_move + 0.5 * gamma * underlying_move * underlying_move)
-    estimated_value = round(estimated_option_price * 100 * max_contracts, 2)
+    signed_move_pct = -move_pct if contract.contract_type == "put" else move_pct
+    projected = project_premium(
+        contract,
+        underlying_move=underlying_price * signed_move_pct,
+        holding_days=holding_days,
+        iv_change_points=_SCENARIO_IV_CHANGE,
+    )
+    if projected is None:
+        return None, None
+    estimated_value = round(projected * 100 * max_contracts, 2)
     return estimated_value, round(estimated_value - premium_at_risk, 2)
 
 
@@ -332,15 +451,22 @@ def _trade_signal(
     market_context: Optional[MarketContext],
     trend_aligned: Optional[bool],
     expected_move_ok: Optional[bool],
+    levels: Optional[dict] = None,
 ) -> dict:
+    levels = levels or {}
     avoid_reasons = []
     watch_reasons = []
+    # Tracked separately from the reason strings so the income-structure suggestion
+    # can tell "the only problem is direction" from "nobody is quoting this".
+    liquidity_ok = True
 
     ignore_missing_spread = getattr(settings, "ignore_missing_spread_for_signal", False)
     if contract.spread_pct is None:
+        liquidity_ok = False
         if not ignore_missing_spread:
             watch_reasons.append("bid/ask spread unavailable")
     elif contract.spread_pct > min(settings.max_spread_pct, _SIGNAL_MAX_SPREAD_PCT):
+        liquidity_ok = False
         watch_reasons.append("bid/ask spread is wide")
 
     if trend_aligned is False:
@@ -357,12 +483,24 @@ def _trade_signal(
         watch_reasons.append("earnings before expiration")
 
     if contract.volume is None or contract.open_interest is None:
+        liquidity_ok = False
         watch_reasons.append("liquidity data incomplete")
     elif (
         contract.volume < max(settings.min_volume, _SIGNAL_MIN_VOLUME)
         or contract.open_interest < max(settings.min_open_interest, _SIGNAL_MIN_OPEN_INTEREST)
     ):
+        liquidity_ok = False
         watch_reasons.append("liquidity is thin")
+
+    # Decay gate. Theta is per day and the bracket knows how long the move is assumed
+    # to take, so this is answerable rather than a rule of thumb: if the premium
+    # decays by more than this fraction before the target can plausibly be reached,
+    # the position is fighting the clock harder than it is expressing a view.
+    decay_share = _decay_share_of_premium(contract, levels)
+    if decay_share is not None and decay_share > _MAX_DECAY_SHARE:
+        watch_reasons.append(
+            f"time decay costs {decay_share:.0%} of premium over the expected hold"
+        )
 
     if contract.mid_price is None or contract.mid_price <= 0:
         avoid_reasons.append("option price unavailable")
@@ -374,7 +512,7 @@ def _trade_signal(
 
     if watch_reasons:
         signal = "WATCH_ONLY"
-        if _covered_or_cash_secured_candidate(contract, trend_aligned):
+        if _income_structure_applies(trend_aligned, liquidity_ok, watch_reasons):
             signal = _income_signal(contract)
         return {"trade_signal": signal, "signal_reason": "; ".join(watch_reasons)}
 
@@ -385,8 +523,34 @@ def _trade_signal(
     return {"trade_signal": "AVOID", "signal_reason": "unsupported contract type"}
 
 
-def _covered_or_cash_secured_candidate(contract: OptionContract, trend_aligned: Optional[bool]) -> bool:
-    return trend_aligned is False and contract.spread_pct is not None
+def _decay_share_of_premium(contract: OptionContract, levels: dict) -> Optional[float]:
+    """Fraction of the premium theta consumes over the assumed hold to target."""
+    per_day = theta_per_premium(contract)
+    hold_days = levels.get("target_hold_days")
+    if per_day is None or not hold_days:
+        return None
+    return round(per_day * hold_days, 4)
+
+
+def _income_structure_applies(
+    trend_aligned: Optional[bool],
+    liquidity_ok: bool,
+    watch_reasons: List[str],
+) -> bool:
+    """
+    Whether suggesting the *sold* structure instead is actually sensible.
+
+    Only when the sole objection is that the trend points the other way — selling
+    premium into a trend that is against the long side is a real alternative. It is
+    not an alternative when the contract is illiquid or unquoted: the old rule fired
+    on ``trend_aligned is False and spread_pct is not None``, so a thinly traded
+    contract that merely happened to have a quote was labelled COVERED_CALL_ONLY on
+    the strength of a liquidity warning, recommending a sale of something nobody is
+    trading.
+    """
+    if trend_aligned is not False or not liquidity_ok:
+        return False
+    return all("trend" in reason for reason in watch_reasons)
 
 
 def _income_signal(contract: OptionContract) -> str:

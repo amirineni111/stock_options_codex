@@ -32,6 +32,24 @@ SCAN_RESULT_EXTRA_COLUMNS = {
     "decision_checklist": "TEXT",
     "trade_signal": "TEXT",
     "signal_reason": "TEXT",
+    # Greeks-derived columns. Theta and vega were fetched and stored from the start
+    # but never read by any calculation until the decay model landed.
+    "underlying_atr14": "REAL",
+    "theta_per_premium": "REAL",
+    "gamma_leverage": "REAL",
+    "iv_rank": "REAL",
+    "premium_entry": "REAL",
+    "premium_stop": "REAL",
+    "premium_target": "REAL",
+    "underlying_stop": "REAL",
+    "underlying_target": "REAL",
+    "risk_dollars": "REAL",
+    "reward_dollars": "REAL",
+    "premium_rr": "REAL",
+    "target_hold_days": "REAL",
+    "decay_at_target": "REAL",
+    "model_prob": "REAL",
+    "required_prob": "REAL",
 }
 # The single source of truth for the intraday results table: column name -> SQL type,
 # in insert order. The DDL, the INSERT column list, and the value tuple are all
@@ -100,6 +118,38 @@ INTRADAY_COLUMNS = {
 
 # Columns stored as 0/1 rather than as SQLite booleans.
 _INTRADAY_BOOL_COLUMNS = {"at_key_level", "blocked_ahead"}
+
+# Number of columns the options INSERT lists explicitly, before the generated tail.
+_BASE_RESULT_COLUMN_COUNT = 49
+
+# The greeks-derived fields, appended to the options INSERT from one list so the
+# column names, the placeholders and the value tuple cannot drift apart.
+_EXTRA_RESULT_FIELDS = (
+    "underlying_atr14",
+    "theta_per_premium",
+    "gamma_leverage",
+    "iv_rank",
+    "premium_entry",
+    "premium_stop",
+    "premium_target",
+    "underlying_stop",
+    "underlying_target",
+    "risk_dollars",
+    "reward_dollars",
+    "premium_rr",
+    "target_hold_days",
+    "decay_at_target",
+    "model_prob",
+    "required_prob",
+)
+
+
+def _extra_result_columns_sql() -> str:
+    return "".join(f", {name}" for name in _EXTRA_RESULT_FIELDS)
+
+
+def _result_placeholders() -> str:
+    return ", ".join("?" * (_BASE_RESULT_COLUMN_COUNT + len(_EXTRA_RESULT_FIELDS)))
 
 
 class Storage:
@@ -319,13 +369,15 @@ class Storage:
                     result.signal_reason,
                     result.reason,
                     c.as_of.isoformat(),
+                    # Greeks-derived tail, in the same order as _EXTRA_RESULT_FIELDS.
+                    *(getattr(result, name) for name in _EXTRA_RESULT_FIELDS),
                 )
             )
         if not rows:
             return
         with self._connect() as conn:
             conn.executemany(
-                """
+                f"""
                 INSERT INTO scan_results (
                     scan_id, rank, underlying, contract_ticker, contract_type, expiration_date,
                     strike_price, bid, ask, last_price, mid_price, spread_pct, delta, gamma,
@@ -336,8 +388,8 @@ class Storage:
                     earnings_date, earnings_warning, breakeven_distance_pct, expected_move_pct,
                     expected_move_to_breakeven_ok, favorable_2pct_value, favorable_2pct_pnl,
                     adverse_2pct_value, adverse_2pct_pnl, decision_checklist, trade_signal,
-                    signal_reason, reason, as_of
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    signal_reason, reason, as_of{_extra_result_columns_sql()}
+                ) VALUES ({_result_placeholders()})
                 """,
                 rows,
             )
