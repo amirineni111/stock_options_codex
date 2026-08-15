@@ -20,12 +20,19 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel
 
 from . import indicators as ind
 from .config import AppSettings
+from .features import (
+    INTRADAY_FEATURE_NAMES,
+    INTRADAY_FEATURE_VERSION,
+    build_intraday_features,
+    to_vector,
+)
 from .market_hours import (
     current_market_phase,
     market_open_today_utc,
@@ -37,6 +44,7 @@ from .polygon import PolygonClient
 from .relative_strength import calculate_rs, rs_assessment, rs_bonus
 from .signals import MIN_TARGET_PCT, score_ticker
 from .timeutil import parse_ts, utc_now
+from .training import load_serving_model
 from .universe import normalize_symbol
 from .yahoo_client import DataFetchError, shared_client
 
@@ -169,7 +177,13 @@ def run_intraday_scan(
     request: IntradayScanRequest,
     now: Optional[datetime] = None,
     client=None,
+    storage=None,
 ) -> Tuple[List[IntradayResult], IntradayScanSummary, List[Dict[str, Any]]]:
+    """
+    Run one scan. When ``storage`` is supplied the scan also closes the loop: open
+    forward-tests are resolved against the fresh bars *before* new signals are armed,
+    so a setup cannot be re-armed in the same pass that stops it out.
+    """
     now = now or utc_now()
     client = client or shared_client
     summary = IntradayScanSummary(scanned=len(request.tickers))
@@ -189,6 +203,13 @@ def run_intraday_scan(
     or_end_utc = opening_range_end_utc(now)
     mins_to_close = minutes_to_close(now)
     spreads = _observed_spreads(settings, tickers, logs, now)
+
+    model = model_mode = None
+    if storage is not None:
+        try:
+            model, model_mode = load_serving_model(storage, "intraday")
+        except Exception as exc:
+            logs.append(_log("ALL", None, f"model load failed, serving rules only: {exc}", now))
 
     contexts: Dict[str, Dict[str, Any]] = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -225,6 +246,8 @@ def run_intraday_scan(
                 mins_to_close=mins_to_close,
                 observed_spread_pct=spreads.get(ticker),
                 now=now,
+                model=model,
+                model_mode=model_mode,
             )
         except Exception as exc:
             summary.errors += 1
@@ -240,10 +263,64 @@ def run_intraday_scan(
             summary.accepted += 1
         logs.append(_log(ticker, result.trade_signal, None, now))
 
+    # ── Phase 3: close the loop ─────────────────────────────────────────────
+    # Resolve first, then arm. The other order would let a setup that just stopped
+    # out be re-armed in the same pass, before the cooldown has anything to act on.
+    if storage is not None:
+        signal_bars = frames.get(SIGNAL_INTERVAL) or {}
+        for ticker in tickers:
+            try:
+                storage.resolve_intraday_signals(ticker, signal_bars.get(ticker) or [], now=now)
+            except Exception as exc:
+                logs.append(_log(ticker, None, f"tracking eval failed: {exc}", now))
+        for result in results:
+            try:
+                _arm_signal(storage, result, now, model_mode)
+            except Exception as exc:
+                logs.append(_log(result.ticker, None, f"tracking record failed: {exc}", now))
+
     results.sort(key=lambda item: item.total_score, reverse=True)
     for index, result in enumerate(results, start=1):
         result.rank = index
     return results, summary, logs
+
+
+def _arm_signal(
+    storage,
+    result: IntradayResult,
+    now: datetime,
+    model_mode: Optional[str] = None,
+) -> None:
+    """Arm one result for forward testing, if it clears the gates."""
+    armable, _ = is_armable(result, now)
+    if not armable:
+        return
+    storage.record_tracked_signal(
+        lane="intraday",
+        ticker=result.ticker,
+        signal=result.trade_signal,
+        direction=1 if result.dominant == "LONG" else -1,
+        entry=result.suggested_entry,
+        stop=result.suggested_stop,
+        target=result.suggested_target,
+        entry_ts=result.bar_timestamp or now.isoformat(),
+        stop_dollars=result.stop_dollars,
+        target_dollars=result.target_dollars,
+        atr14=result.atr14,
+        # The feature vector as it was at arm time — see storage.record_tracked_signal.
+        features=build_intraday_features(result),
+        feature_version=INTRADAY_FEATURE_VERSION,
+        model_prob=result.model_prob,
+        required_prob=result.required_prob,
+        # Rows scored by a *gating* model are a censored sample — only the trades it
+        # allowed have outcomes — so they can never be pooled with shadow rows when
+        # judging that model. Recording which mode produced the probability is the
+        # only thing that keeps the two separable later.
+        model_mode=model_mode,
+        cost_pct=result.cost_pct,
+        cost_ratio=result.cost_ratio,
+        total_score=result.total_score,
+    )
 
 
 # ── Phase 1 helpers ──────────────────────────────────────────────────────────
@@ -420,6 +497,8 @@ def _score_context(
     mins_to_close: Optional[float],
     observed_spread_pct: Optional[float],
     now: datetime,
+    model=None,
+    model_mode: Optional[str] = None,
 ) -> IntradayResult:
     """
     Score once to learn the direction, then rescore with relative strength folded in.
@@ -458,6 +537,24 @@ def _score_context(
         bonus = rs_bonus(assessment, base["dominant"])
 
     scored = _score(bonus) if bonus else base
+
+    # Model pass. A shadow model scores and logs but changes nothing: it is the only
+    # way to learn what it would do to the trades it wants to block, because once it
+    # is gating those trades stop happening and stop being measurable.
+    if model is not None and scored["dominant"] in ("LONG", "SHORT"):
+        try:
+            features = build_intraday_features(_feature_source(context, scored))
+            probability = model.predict_one(to_vector(features, INTRADAY_FEATURE_NAMES))
+        except Exception:
+            probability = None  # a bad model must not take the scan down
+        if probability is not None:
+            if model_mode == "active":
+                # Rescore so the veto flows through the same path every other gate
+                # uses, rather than being patched onto a finished result.
+                scored = _score(bonus, model_prob=probability)
+            else:
+                scored = {**scored, "model_prob": probability}
+
     scored = _apply_instrument_filters(scored, context, request)
 
     return IntradayResult(
@@ -515,6 +612,42 @@ def _score_context(
         market_phase=scored["market_phase"],
         bar_timestamp=context["bar_timestamp"],
         as_of=now,
+    )
+
+
+def _feature_source(context: Dict[str, Any], scored: Dict[str, Any]) -> SimpleNamespace:
+    """
+    The fields ``build_intraday_features`` reads, as one attribute bag.
+
+    Serving builds features from this rather than from a finished ``IntradayResult``
+    so the model can be consulted *before* the result is constructed — which is what
+    lets an active model's veto flow through a genuine rescore instead of being
+    patched onto the output. Field names match the result's exactly, so the training
+    path (which does read the stored result) sees the identical contract.
+    """
+    values = context["indicators"]
+    return SimpleNamespace(
+        dominant=scored["dominant"],
+        atr14=values.get("atr14"),
+        adx14=values.get("adx14"),
+        rsi14=values.get("rsi14"),
+        ema9=values.get("ema9"),
+        ema20=values.get("ema20"),
+        macd_histogram=values.get("macd_histogram"),
+        relative_volume=values.get("rel_volume"),
+        avg_dollar_volume=context["avg_dollar_volume"],
+        last_price=context["last"],
+        high=context["session_high"],
+        low=context["session_low"],
+        extension_atr=scored["extension_atr"],
+        mtf_score=scored["mtf_score"],
+        sr_score=scored["sr_score"],
+        cost_ratio=scored["cost_ratio"],
+        # The provisional stop, so a non-actionable setup still reports a real bracket
+        # size rather than a zero standing in for "no bracket".
+        stop_pct=scored.get("stop_pct") or scored.get("prov_stop_pct"),
+        total_score=scored["total_score"],
+        bar_timestamp=context["bar_timestamp"],
     )
 
 

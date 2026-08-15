@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
@@ -11,6 +11,7 @@ import pandas as pd
 from .intraday import IntradayResult
 from .models import RejectedContract, ScoredContract
 from .scoring import days_to_expiration
+from .timeutil import exchange_date, minutes_between, parse_ts, utc_now
 
 SQLITE_TIMEOUT_SECONDS = 30.0
 SQLITE_BUSY_TIMEOUT_MS = 30000
@@ -260,6 +261,87 @@ class Storage:
                     signal TEXT,
                     error TEXT,
                     provider TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+                -- ── Forward testing ──────────────────────────────────────────
+                -- Both lanes share one schema, distinguished by `lane`, rather than
+                -- two parallel sets of tables and two copies of every method.
+                CREATE TABLE IF NOT EXISTS signal_tracking (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    lane TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    contract_ticker TEXT,
+                    signal TEXT,
+                    direction INTEGER NOT NULL,
+                    entry_price REAL,
+                    stop_price REAL,
+                    target_price REAL,
+                    stop_dollars REAL,
+                    target_dollars REAL,
+                    atr14 REAL,
+                    entry_ts TEXT,
+                    expiration_date TEXT,
+                    -- The feature vector as it was AT ARM TIME. Recomputing it later
+                    -- is impossible: the snapshot tables are replaced every scan, so
+                    -- by the time a trade resolves its inputs are gone and the
+                    -- outcome row is unlearnable.
+                    features_json TEXT,
+                    feature_version INTEGER,
+                    model_prob REAL,
+                    required_prob REAL,
+                    -- Which serving mode produced model_prob. Rows scored by a
+                    -- gating model are a censored sample and must never be pooled
+                    -- with shadow rows when judging that model.
+                    model_mode TEXT,
+                    cost_pct REAL,
+                    cost_ratio REAL,
+                    total_score REAL,
+                    status TEXT DEFAULT 'open',
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS trade_outcomes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    lane TEXT NOT NULL,
+                    tracking_id INTEGER,
+                    ticker TEXT,
+                    contract_ticker TEXT,
+                    signal TEXT,
+                    entry_price REAL,
+                    exit_price REAL,
+                    gross_dollars REAL,
+                    cost_dollars REAL,
+                    net_dollars REAL,
+                    exit_pct REAL,
+                    r_multiple REAL,
+                    outcome TEXT,
+                    hold_minutes INTEGER,
+                    exit_ts TEXT,
+                    exit_reason TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS performance_stats (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    lane TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    scope_value TEXT,
+                    trades INTEGER,
+                    wins INTEGER,
+                    losses INTEGER,
+                    win_rate REAL,
+                    avg_r REAL,
+                    total_r REAL,
+                    avg_hold_minutes REAL,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS trained_models (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL,
+                    model_json TEXT NOT NULL,
+                    feature_version INTEGER,
+                    metrics_json TEXT,
+                    notes TEXT,
+                    is_active INTEGER DEFAULT 0,
+                    is_shadow INTEGER DEFAULT 0,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS intraday_watchlist (
@@ -530,6 +612,474 @@ class Storage:
     def load_intraday_watchlist(self) -> pd.DataFrame:
         with self._connect() as conn:
             return pd.read_sql_query("SELECT * FROM intraday_watchlist ORDER BY id DESC", conn)
+
+    def load_iv_history(self, underlying: str, limit: int = 500) -> List[float]:
+        """
+        Recent implied-volatility observations for one underlying, for the IV rank.
+
+        Read from the scan history this repo has been accumulating since its first
+        commit — the data was already there, nothing was using it. One observation per
+        scan per underlying (the median across that scan's contracts) rather than every
+        contract, so a chain with 200 strikes does not outvote 200 days of history.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT AVG(implied_volatility) AS iv
+                FROM scan_results
+                WHERE underlying = ? AND implied_volatility IS NOT NULL
+                GROUP BY scan_id
+                ORDER BY scan_id DESC
+                LIMIT ?
+                """,
+                (underlying.upper(), limit),
+            ).fetchall()
+        return [row[0] for row in rows if row[0] is not None]
+
+    # ── Forward testing ──────────────────────────────────────────────────────
+
+    # Without a cooldown, every scan after a stop-out re-enters the same chop and
+    # racks up correlated losses that look like independent evidence to the model.
+    REARM_COOLDOWN_MINUTES = 45
+
+    def record_tracked_signal(
+        self,
+        lane: str,
+        ticker: str,
+        signal: str,
+        direction: int,
+        entry: float,
+        stop: float,
+        target: float,
+        entry_ts: str,
+        contract_ticker: Optional[str] = None,
+        stop_dollars: Optional[float] = None,
+        target_dollars: Optional[float] = None,
+        atr14: Optional[float] = None,
+        expiration_date: Optional[str] = None,
+        features: Optional[Dict] = None,
+        feature_version: Optional[int] = None,
+        model_prob: Optional[float] = None,
+        required_prob: Optional[float] = None,
+        model_mode: Optional[str] = None,
+        cost_pct: Optional[float] = None,
+        cost_ratio: Optional[float] = None,
+        total_score: Optional[float] = None,
+    ) -> Optional[int]:
+        """
+        Arm an actionable signal for hands-off forward evaluation.
+
+        Returns the new tracking id, or ``None`` when the signal was suppressed
+        because an identical one is already open or was armed inside the cooldown.
+
+        ``features`` is captured **here, at arm time**, and this is the load-bearing
+        detail of the whole learning loop: the snapshot tables are replaced on every
+        scan, so if the vector is not stored now it cannot be reconstructed when the
+        trade resolves days later, and the outcome row is unlearnable.
+        """
+        # Dedupe key: the specific instrument. Two different AAPL contracts are
+        # genuinely different trades, so the key includes the contract when there is
+        # one and falls back to the ticker for the equity lane.
+        instrument = contract_ticker or ticker
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM signal_tracking "
+                "WHERE lane=? AND COALESCE(contract_ticker, ticker)=? AND direction=? "
+                "AND (status='open' OR created_at >= datetime('now', ?)) LIMIT 1",
+                (lane, instrument, direction, f"-{self.REARM_COOLDOWN_MINUTES} minutes"),
+            ).fetchone()
+            if existing:
+                return None
+            cursor = conn.execute(
+                """
+                INSERT INTO signal_tracking (
+                    lane, ticker, contract_ticker, signal, direction, entry_price,
+                    stop_price, target_price, stop_dollars, target_dollars, atr14,
+                    entry_ts, expiration_date, features_json, feature_version,
+                    model_prob, required_prob, model_mode, cost_pct, cost_ratio,
+                    total_score
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    lane, ticker, contract_ticker, signal, direction, entry,
+                    stop, target, stop_dollars, target_dollars, atr14,
+                    entry_ts, expiration_date,
+                    json.dumps(features) if features else None, feature_version,
+                    model_prob, required_prob, model_mode, cost_pct, cost_ratio,
+                    total_score,
+                ),
+            )
+            return cursor.lastrowid
+
+    def load_open_tracked(self, lane: str, ticker: Optional[str] = None) -> List[Dict]:
+        query = "SELECT * FROM signal_tracking WHERE lane=? AND status='open'"
+        params: List = [lane]
+        if ticker:
+            query += " AND ticker=?"
+            params.append(ticker)
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+    def resolve_intraday_signals(
+        self,
+        ticker: str,
+        bars: List[Dict],
+        max_hold_hours: float = 8.0,
+        now: Optional[datetime] = None,
+    ) -> int:
+        """
+        Resolve open equity signals against forward bars. Returns the number closed.
+
+        The stop is checked **before** the target within each bar. When a single bar
+        spans both levels there is no way to know which was touched first, so the
+        conservative reading is taken — assuming the target every time would inflate
+        the win rate exactly on the most volatile bars.
+
+        Forward bars are selected by string comparison, which is valid only because
+        every writer emits the one UTC ISO-8601 format ``timeutil.to_iso`` produces.
+        """
+        open_rows = self.load_open_tracked("intraday", ticker)
+        if not open_rows:
+            return 0
+
+        now = now or utc_now()
+        resolved = 0
+        for row in open_rows:
+            entry_ts = row.get("entry_ts") or ""
+            direction = row.get("direction") or 1
+            stop = row.get("stop_price") or 0.0
+            target = row.get("target_price") or 0.0
+            forward = [b for b in bars if (b.get("timestamp") or "") > entry_ts]
+
+            exit_price = outcome = exit_ts = exit_reason = None
+            for bar in forward:
+                high, low = bar.get("high"), bar.get("low")
+                if high is None or low is None:
+                    continue
+                if direction == 1:
+                    if low <= stop:
+                        exit_price, outcome, exit_reason = stop, "LOSS", "STOP"
+                    elif high >= target:
+                        exit_price, outcome, exit_reason = target, "WIN", "TARGET"
+                else:
+                    if high >= stop:
+                        exit_price, outcome, exit_reason = stop, "LOSS", "STOP"
+                    elif low <= target:
+                        exit_price, outcome, exit_reason = target, "WIN", "TARGET"
+                if outcome:
+                    exit_ts = bar.get("timestamp")
+                    break
+
+            if outcome is None:
+                created = parse_ts(row.get("created_at"))
+                aged_out = created is not None and (now - created).total_seconds() > max_hold_hours * 3600
+                if aged_out and forward:
+                    exit_price = forward[-1].get("close")
+                    exit_ts = forward[-1].get("timestamp")
+                    exit_reason = "TIMEOUT"
+                else:
+                    continue  # still live
+
+            self._close_tracked(row, "intraday", exit_price, exit_ts, exit_reason, outcome)
+            resolved += 1
+
+        if resolved:
+            self.compute_and_save_performance("intraday")
+        return resolved
+
+    def resolve_options_signals(
+        self,
+        quotes: Dict[str, Optional[float]],
+        today: Optional[date] = None,
+        now: Optional[datetime] = None,
+        max_hold_days: float = 30.0,
+    ) -> int:
+        """
+        Resolve open option signals against fresh contract mids.
+
+        ``quotes`` maps contract ticker to its current mid. Unlike the equity lane
+        there are no forward *bars* here — only the point-in-time snapshots each scan
+        happens to take — so a level touched and retraced between two scans is missed.
+        That is a real limitation and it cuts both ways: a missed target understates
+        the win rate, a missed stop overstates it. Checking the stop first on every
+        observation keeps the bias conservative, and the alternative (inferring the
+        premium path from the underlying) would replace a measurement gap with a
+        modelling assumption.
+
+        Also closes anything at or past expiry, and anything held past
+        ``max_hold_days``.
+        """
+        open_rows = self.load_open_tracked("options")
+        if not open_rows:
+            return 0
+
+        now = now or utc_now()
+        today = today or exchange_date(now)
+        resolved = 0
+
+        for row in open_rows:
+            contract = row.get("contract_ticker")
+            mid = quotes.get(contract) if contract else None
+            stop = row.get("stop_price") or 0.0
+            target = row.get("target_price") or 0.0
+            exit_price = outcome = exit_reason = None
+
+            if mid is not None:
+                # A long option: premium falling to the stop is the loss, rising to
+                # the target is the win. Direction is already baked into the bracket.
+                if mid <= stop:
+                    exit_price, outcome, exit_reason = mid, "LOSS", "STOP"
+                elif mid >= target:
+                    exit_price, outcome, exit_reason = mid, "WIN", "TARGET"
+
+            if outcome is None:
+                expiry = row.get("expiration_date")
+                expiry_date = date.fromisoformat(expiry) if expiry else None
+                created = parse_ts(row.get("created_at"))
+                aged_out = created is not None and (now - created).total_seconds() > max_hold_days * 86400
+                # Close a day before expiry: the last session is gamma/decay noise,
+                # not a test of the thesis.
+                expiring = expiry_date is not None and today >= expiry_date - timedelta(days=1)
+                if (expiring or aged_out) and mid is not None:
+                    exit_price = mid
+                    exit_reason = "EXPIRY" if expiring else "TIMEOUT"
+                else:
+                    continue
+
+            self._close_tracked(row, "options", exit_price, now.isoformat(), exit_reason, outcome)
+            resolved += 1
+
+        if resolved:
+            self.compute_and_save_performance("options")
+        return resolved
+
+    def _close_tracked(
+        self,
+        row: Dict,
+        lane: str,
+        exit_price: Optional[float],
+        exit_ts: Optional[str],
+        exit_reason: Optional[str],
+        outcome: Optional[str],
+    ) -> None:
+        """
+        Write the outcome row and mark the tracking row closed.
+
+        **R is computed from net, not gross.** Every fill costs the spread twice, and
+        a bracket that touches its printed target still paid to get in and out.
+        Reporting gross R overstates every result by a consistent margin, which is
+        exactly the kind of error that survives a review because it makes the numbers
+        look plausible.
+        """
+        entry_price = row.get("entry_price") or 0.0
+        direction = row.get("direction") or 1
+        stop_dollars = row.get("stop_dollars") or 0.0
+        exit_price = exit_price or 0.0
+
+        gross_dollars = round((exit_price - entry_price) * direction, 4) if entry_price else 0.0
+        cost_dollars = (
+            round((row.get("cost_pct") or 0.0) / 100.0 * entry_price, 4) if entry_price else 0.0
+        )
+        net_dollars = round(gross_dollars - cost_dollars, 4)
+        if exit_reason in ("TIMEOUT", "EXPIRY"):
+            outcome = "WIN" if net_dollars > 0 else ("LOSS" if net_dollars < 0 else "BREAKEVEN")
+        exit_pct = round(net_dollars / entry_price * 100, 4) if entry_price else 0.0
+        r_multiple = round(net_dollars / stop_dollars, 4) if stop_dollars else None
+
+        # Real trade duration: entry bar to resolving bar. Measuring it as
+        # (now - created_at) reports how long until a scan happened to look, which in
+        # the forex sibling made wins and losses both average the same ~506 minutes.
+        hold_minutes = minutes_between(row.get("entry_ts") or row.get("created_at"), exit_ts)
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO trade_outcomes (
+                    lane, tracking_id, ticker, contract_ticker, signal, entry_price,
+                    exit_price, gross_dollars, cost_dollars, net_dollars, exit_pct,
+                    r_multiple, outcome, hold_minutes, exit_ts, exit_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    lane, row["id"], row.get("ticker"), row.get("contract_ticker"),
+                    row.get("signal"), entry_price, exit_price, gross_dollars,
+                    cost_dollars, net_dollars, exit_pct, r_multiple, outcome,
+                    int(hold_minutes) if hold_minutes is not None else None,
+                    exit_ts, exit_reason,
+                ),
+            )
+            conn.execute("UPDATE signal_tracking SET status='closed' WHERE id=?", (row["id"],))
+
+    def compute_and_save_performance(self, lane: str) -> None:
+        """Recompute the aggregate stats a lane's Performance tab reads."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM performance_stats WHERE lane=?", (lane,))
+            conn.execute(
+                """
+                INSERT INTO performance_stats (
+                    lane, scope, scope_value, trades, wins, losses, win_rate,
+                    avg_r, total_r, avg_hold_minutes
+                )
+                SELECT ?, 'overall', 'ALL',
+                       COUNT(*),
+                       SUM(outcome='WIN'), SUM(outcome='LOSS'),
+                       1.0 * SUM(outcome='WIN') / COUNT(*),
+                       AVG(r_multiple), SUM(r_multiple), AVG(hold_minutes)
+                FROM trade_outcomes WHERE lane=?
+                """,
+                (lane, lane),
+            )
+            # Per-signal breakdown, so a tier that never outperforms is visible as
+            # such rather than hidden inside the overall average.
+            conn.execute(
+                """
+                INSERT INTO performance_stats (
+                    lane, scope, scope_value, trades, wins, losses, win_rate,
+                    avg_r, total_r, avg_hold_minutes
+                )
+                SELECT ?, 'signal', signal,
+                       COUNT(*),
+                       SUM(outcome='WIN'), SUM(outcome='LOSS'),
+                       1.0 * SUM(outcome='WIN') / COUNT(*),
+                       AVG(r_multiple), SUM(r_multiple), AVG(hold_minutes)
+                FROM trade_outcomes WHERE lane=? GROUP BY signal
+                """,
+                (lane, lane),
+            )
+
+    def load_performance(self, lane: str) -> pd.DataFrame:
+        with self._connect() as conn:
+            return pd.read_sql_query(
+                "SELECT * FROM performance_stats WHERE lane=? ORDER BY scope, scope_value",
+                conn,
+                params=(lane,),
+            )
+
+    def load_outcomes(self, lane: str, limit: int = 1000) -> pd.DataFrame:
+        with self._connect() as conn:
+            return pd.read_sql_query(
+                "SELECT * FROM trade_outcomes WHERE lane=? ORDER BY id DESC LIMIT ?",
+                conn,
+                params=(lane, limit),
+            )
+
+    def load_tracked(self, lane: str, status: Optional[str] = None) -> pd.DataFrame:
+        query = "SELECT * FROM signal_tracking WHERE lane=?"
+        params: List = [lane]
+        if status:
+            query += " AND status=?"
+            params.append(status)
+        with self._connect() as conn:
+            return pd.read_sql_query(query + " ORDER BY id DESC", conn, params=params)
+
+    def load_training_rows(self, lane: str, feature_version: int) -> List[Dict]:
+        """
+        Resolved trades that carry a feature vector at the current contract version.
+
+        Rows armed before feature logging existed, or under a different feature
+        contract, are **excluded rather than imputed**: their inputs are unrecoverable
+        and inventing them would train the model on fiction.
+        """
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT t.features_json, t.model_mode, t.model_prob, t.required_prob,
+                       t.signal, t.total_score,
+                       o.outcome, o.r_multiple, o.net_dollars, o.exit_reason
+                FROM trade_outcomes o
+                JOIN signal_tracking t ON t.id = o.tracking_id
+                WHERE o.lane = ?
+                  AND t.features_json IS NOT NULL
+                  AND t.feature_version = ?
+                  AND o.outcome IN ('WIN', 'LOSS')
+                ORDER BY o.id ASC
+                """,
+                (lane, feature_version),
+            ).fetchall()
+        out = []
+        for row in rows:
+            record = dict(row)
+            try:
+                record["features"] = json.loads(record.pop("features_json"))
+            except (TypeError, ValueError):
+                continue
+            out.append(record)
+        return out
+
+    # ── Model store ──────────────────────────────────────────────────────────
+
+    def save_model(
+        self,
+        kind: str,
+        model_json: str,
+        feature_version: int,
+        metrics: Optional[Dict] = None,
+        notes: Optional[str] = None,
+        activate: bool = False,
+        shadow: bool = False,
+    ) -> int:
+        """
+        Store a trained candidate. It saves **inactive** unless explicitly activated.
+
+        Training must never change live behaviour as a side effect: a model is
+        reviewed against its own metrics first, and promoting it is a separate,
+        deliberate act that can be rolled back.
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO trained_models (
+                    kind, model_json, feature_version, metrics_json, notes,
+                    is_active, is_shadow
+                ) VALUES (?, ?, ?, ?, ?, 0, 0)
+                """,
+                (kind, model_json, feature_version, json.dumps(metrics or {}), notes),
+            )
+            model_id = cursor.lastrowid
+        if activate:
+            self.set_model_flag(kind, model_id, "is_active")
+        elif shadow:
+            self.set_model_flag(kind, model_id, "is_shadow")
+        return model_id
+
+    def set_model_flag(self, kind: str, model_id: int, flag: str) -> None:
+        """Make one model the active (or shadow) one for a lane, clearing the rest."""
+        # The only place a column name is interpolated, so it is whitelisted rather
+        # than trusted.
+        if flag not in ("is_active", "is_shadow"):
+            raise ValueError(f"unknown model flag: {flag}")
+        with self._connect() as conn:
+            conn.execute(f"UPDATE trained_models SET {flag}=0 WHERE kind=?", (kind,))
+            conn.execute(f"UPDATE trained_models SET {flag}=1 WHERE id=? AND kind=?", (model_id, kind))
+
+    def clear_model_flag(self, kind: str, flag: str) -> None:
+        if flag not in ("is_active", "is_shadow"):
+            raise ValueError(f"unknown model flag: {flag}")
+        with self._connect() as conn:
+            conn.execute(f"UPDATE trained_models SET {flag}=0 WHERE kind=?", (kind,))
+
+    def load_model(self, kind: str, flag: str = "is_active") -> Optional[Dict]:
+        if flag not in ("is_active", "is_shadow"):
+            raise ValueError(f"unknown model flag: {flag}")
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                f"SELECT * FROM trained_models WHERE kind=? AND {flag}=1 "
+                "ORDER BY id DESC LIMIT 1",
+                (kind,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def load_models(self, kind: str) -> pd.DataFrame:
+        with self._connect() as conn:
+            return pd.read_sql_query(
+                "SELECT id, kind, feature_version, metrics_json, notes, is_active, "
+                "is_shadow, created_at FROM trained_models WHERE kind=? ORDER BY id DESC",
+                conn,
+                params=(kind,),
+            )
 
     def _read_latest(self, table: str, order_by: str) -> pd.DataFrame:
         with self._connect() as conn:
