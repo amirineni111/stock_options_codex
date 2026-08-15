@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 from datetime import date, timedelta
-from typing import List
+from typing import List, Optional
 
 from pydantic import BaseModel
 
@@ -8,6 +10,11 @@ from .models import MarketContext, RejectedContract, ScoredContract
 from .polygon import PolygonClient
 from .scoring import score_contracts
 from .storage import Storage
+from .timeutil import exchange_date
+
+# Daily-bar lookback for the trend context. 110 calendar days is ~75 trading days:
+# enough to seed a 50-period SMA and a 14-period ADX with room for holidays.
+_CONTEXT_LOOKBACK_DAYS = 110
 
 
 class ScanRequest(BaseModel):
@@ -37,12 +44,19 @@ class ScanSummary(BaseModel):
     errors: int = 0
 
 
-def run_scan(settings: AppSettings, storage: Storage, request: ScanRequest) -> ScanSummary:
+def run_scan(
+    settings: AppSettings,
+    storage: Storage,
+    request: ScanRequest,
+    today: Optional[date] = None,
+) -> ScanSummary:
     client = PolygonClient(settings.polygon_api_key, settings.request_timeout_seconds)
     storage.start_scan(request.model_dump())
 
     summary = ScanSummary()
-    today = date.today()
+    # Exchange date, not local date: an evening scan would otherwise shift the whole
+    # expiry window by a day relative to the DTE the scorer computes.
+    today = today or exchange_date()
     expiration_gte = today + timedelta(days=request.min_days_to_expiration)
     expiration_lte = today + timedelta(days=request.max_days_to_expiration)
     all_accepted: List[ScoredContract] = []
@@ -55,9 +69,9 @@ def run_scan(settings: AppSettings, storage: Storage, request: ScanRequest) -> S
                 ticker,
                 expiration_gte=expiration_gte,
                 expiration_lte=expiration_lte,
-                limit=request.max_contracts_per_ticker,
+                max_contracts=request.max_contracts_per_ticker,
             )
-            accepted, rejected = score_contracts(contracts, request, market_context)
+            accepted, rejected = score_contracts(contracts, request, market_context, today=today)
             all_accepted.extend(accepted)
             all_rejected.extend(rejected)
             summary.accepted += len(accepted)
@@ -74,7 +88,7 @@ def run_scan(settings: AppSettings, storage: Storage, request: ScanRequest) -> S
     return summary
 
 
-def _sanitize_error(message: str, api_key: str = None) -> str:
+def _sanitize_error(message: str, api_key: Optional[str] = None) -> str:
     if not message:
         return message
     safe = message
@@ -95,10 +109,11 @@ def _load_market_context(
     try:
         return client.get_market_context(
             ticker,
-            start=today - timedelta(days=110),
+            start=today - timedelta(days=_CONTEXT_LOOKBACK_DAYS),
             end=today,
             earnings_end=expiration_lte,
             check_earnings=request.check_earnings,
+            today=today,
         )
     except Exception as exc:
         warning = _sanitize_error(str(exc), client.api_key)

@@ -1,12 +1,16 @@
+from __future__ import annotations
+
 import json
 import sqlite3
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 
 import pandas as pd
 
 from .intraday import IntradayResult
 from .models import RejectedContract, ScoredContract
+from .scoring import days_to_expiration
 
 SQLITE_TIMEOUT_SECONDS = 30.0
 SQLITE_BUSY_TIMEOUT_MS = 30000
@@ -29,15 +33,73 @@ SCAN_RESULT_EXTRA_COLUMNS = {
     "trade_signal": "TEXT",
     "signal_reason": "TEXT",
 }
-INTRADAY_RESULT_EXTRA_COLUMNS = {
+# The single source of truth for the intraday results table: column name -> SQL type,
+# in insert order. The DDL, the INSERT column list, and the value tuple are all
+# generated from this.
+#
+# They used to be three hand-maintained parallel lists (plus a fourth in app.py for
+# display), which is a standing invitation for drift — adding a scoring field meant
+# editing four places and the failure mode was a silent column shift, not an error.
+INTRADAY_COLUMNS = {
+    "rank": "INTEGER",
+    "ticker": "TEXT",
+    "last_price": "REAL",
+    "day_change_pct": "REAL",
+    "volume": "INTEGER",
+    "relative_volume": "REAL",
+    "avg_dollar_volume": "REAL",
+    "open": "REAL",
+    "high": "REAL",
+    "low": "REAL",
+    "prev_close": "REAL",
     "rsi14": "REAL",
     "ema9": "REAL",
     "ema20": "REAL",
     "macd": "REAL",
     "macd_signal": "REAL",
     "macd_histogram": "REAL",
+    "atr14": "REAL",
+    "adx14": "REAL",
     "vwap": "REAL",
+    "spread_pct": "REAL",
+    "regime": "TEXT",
+    "dominant": "TEXT",
+    "momentum_score": "REAL",
+    "reversion_score": "REAL",
+    "breakout_score": "REAL",
+    "mtf_score": "REAL",
+    "mtf_confluence": "TEXT",
+    "sr_score": "REAL",
+    "total_score": "REAL",
+    "at_key_level": "INTEGER",
+    "blocked_ahead": "INTEGER",
+    "nearest_support": "REAL",
+    "nearest_resistance": "REAL",
+    "extension_atr": "REAL",
+    "rs_vs_spy": "REAL",
+    "rs_assessment": "TEXT",
+    "suggested_entry": "REAL",
+    "suggested_stop": "REAL",
+    "suggested_target": "REAL",
+    "stop_dollars": "REAL",
+    "target_dollars": "REAL",
+    "stop_pct": "REAL",
+    "target_pct": "REAL",
+    "rr_ratio": "REAL",
+    "cost_pct": "REAL",
+    "cost_ratio": "REAL",
+    "model_prob": "REAL",
+    "required_prob": "REAL",
+    "trade_signal": "TEXT",
+    "signal_reason": "TEXT",
+    "risk_notes": "TEXT",
+    "market_phase": "TEXT",
+    "bar_timestamp": "TEXT",
+    "as_of": "TEXT",
 }
+
+# Columns stored as 0/1 rather than as SQLite booleans.
+_INTRADAY_BOOL_COLUMNS = {"at_key_level", "blocked_ahead"}
 
 
 class Storage:
@@ -142,41 +204,12 @@ class Storage:
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     closed_at TEXT
                 );
-                CREATE TABLE IF NOT EXISTS intraday_results (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    rank INTEGER,
-                    ticker TEXT,
-                    last_price REAL,
-                    day_change_pct REAL,
-                    volume INTEGER,
-                    relative_volume REAL,
-                    open REAL,
-                    high REAL,
-                    low REAL,
-                    prev_close REAL,
-                    minute_price REAL,
-                    rsi14 REAL,
-                    ema9 REAL,
-                    ema20 REAL,
-                    macd REAL,
-                    macd_signal REAL,
-                    macd_histogram REAL,
-                    vwap REAL,
-                    spread_pct REAL,
-                    signal_mode TEXT,
-                    momentum_score REAL,
-                    mean_reversion_score REAL,
-                    total_score REAL,
-                    trade_signal TEXT,
-                    signal_reason TEXT,
-                    risk_notes TEXT,
-                    as_of TEXT
-                );
                 CREATE TABLE IF NOT EXISTS intraday_scan_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ticker TEXT,
                     signal TEXT,
                     error TEXT,
+                    provider TEXT,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS intraday_watchlist (
@@ -193,8 +226,24 @@ class Storage:
                 );
                 """
             )
+            # Generated from the one column spec, so the table can never disagree
+            # with the INSERT or with the model it stores.
+            columns_ddl = ",\n                    ".join(
+                f"{name} {sql_type}" for name, sql_type in INTRADAY_COLUMNS.items()
+            )
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS intraday_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    {columns_ddl}
+                )
+                """
+            )
             self._ensure_columns(conn, "scan_results", SCAN_RESULT_EXTRA_COLUMNS)
-            self._ensure_columns(conn, "intraday_results", INTRADAY_RESULT_EXTRA_COLUMNS)
+            # Additive and idempotent: an existing table from an older build gains the
+            # new scoring columns rather than needing a drop.
+            self._ensure_columns(conn, "intraday_results", INTRADAY_COLUMNS)
+            self._ensure_columns(conn, "intraday_scan_logs", {"provider": "TEXT"})
 
     def start_scan(self, request: Dict) -> int:
         with self._connect() as conn:
@@ -237,7 +286,11 @@ class Storage:
                     c.open_interest,
                     c.volume,
                     c.underlying_price,
-                    (c.expiration_date - c.as_of.date()).days,
+                    # Same exchange-date basis the scorer used. Deriving it here from
+                    # `as_of.date()` (a UTC date) put a different DTE in this column
+                    # than the one the contract was actually filtered and ranked on,
+                    # for every scan run after 20:00 ET.
+                    days_to_expiration(c),
                     result.max_contracts_by_risk,
                     result.premium_at_risk,
                     result.breakeven,
@@ -357,58 +410,35 @@ class Storage:
             return pd.read_sql_query("SELECT * FROM watched_contracts ORDER BY id DESC", conn)
 
     def save_intraday_scan(self, results: Iterable[IntradayResult], logs: Iterable[Dict]) -> None:
-        result_rows = [
-            (
-                r.rank,
-                r.ticker,
-                r.last_price,
-                r.day_change_pct,
-                r.volume,
-                r.relative_volume,
-                r.open,
-                r.high,
-                r.low,
-                r.prev_close,
-                r.minute_price,
-                r.rsi14,
-                r.ema9,
-                r.ema20,
-                r.macd,
-                r.macd_signal,
-                r.macd_histogram,
-                r.vwap,
-                r.spread_pct,
-                r.signal_mode,
-                r.momentum_score,
-                r.mean_reversion_score,
-                r.total_score,
-                r.trade_signal,
-                r.signal_reason,
-                r.risk_notes,
-                r.as_of.isoformat(),
-            )
-            for r in results
+        """
+        Replace the stored intraday scan with this one.
+
+        Only the latest scan is kept: the results are a live view of the tape, and the
+        durable record of what was *decided* lives in the tracking and outcome tables
+        rather than here.
+        """
+        names = list(INTRADAY_COLUMNS)
+        result_rows = [tuple(_intraday_value(r, name) for name in names) for r in results]
+        # `provider` is carried on the log dicts and was previously dropped on the way
+        # in, so the UI could never show which data source produced a row.
+        log_rows = [
+            (row.get("ticker"), row.get("signal"), row.get("error"),
+             row.get("provider"), row.get("created_at"))
+            for row in logs
         ]
-        log_rows = [(row.get("ticker"), row.get("signal"), row.get("error"), row.get("created_at")) for row in logs]
+        placeholders = ", ".join("?" for _ in names)
         with self._connect() as conn:
             conn.execute("DELETE FROM intraday_results")
             conn.execute("DELETE FROM intraday_scan_logs")
             if result_rows:
                 conn.executemany(
-                    """
-                    INSERT INTO intraday_results (
-                        rank, ticker, last_price, day_change_pct, volume, relative_volume,
-                        open, high, low, prev_close, minute_price, rsi14, ema9, ema20,
-                        macd, macd_signal, macd_histogram, vwap, spread_pct, signal_mode,
-                        momentum_score, mean_reversion_score, total_score, trade_signal,
-                        signal_reason, risk_notes, as_of
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
+                    f"INSERT INTO intraday_results ({', '.join(names)}) VALUES ({placeholders})",
                     result_rows,
                 )
             if log_rows:
                 conn.executemany(
-                    "INSERT INTO intraday_scan_logs (ticker, signal, error, created_at) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO intraday_scan_logs (ticker, signal, error, provider, created_at)"
+                    " VALUES (?, ?, ?, ?, ?)",
                     log_rows,
                 )
 
@@ -468,7 +498,17 @@ class Storage:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
 
 
-def _bool_to_int(value) -> int:
+def _intraday_value(result: IntradayResult, column: str):
+    """One column's storable value, pulled off the model by name."""
+    value = getattr(result, column, None)
+    if column in _INTRADAY_BOOL_COLUMNS:
+        return _bool_to_int(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
+def _bool_to_int(value) -> Optional[int]:
     if value is None:
         return None
     return 1 if value else 0

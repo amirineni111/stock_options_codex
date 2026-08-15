@@ -1,9 +1,6 @@
 from datetime import datetime
 import json
-import os
 from pathlib import Path
-import shutil
-import stat
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -12,7 +9,11 @@ from streamlit_autorefresh import st_autorefresh
 
 from options_screening.config import get_settings
 from options_screening.intraday import IntradayScanRequest, run_intraday_scan
-from options_screening.market_hours import is_regular_market_hours
+from options_screening.market_hours import (
+    current_market_phase,
+    is_regular_market_hours,
+    phase_badge_color,
+)
 from options_screening.refresh import format_refresh_interval, refresh_interval_to_ms
 from options_screening.scanner import ScanRequest, run_scan
 from options_screening.storage import Storage
@@ -22,7 +23,11 @@ from options_screening.universe import load_sp100_tickers, load_sp500_tickers
 st.set_page_config(page_title="Options Screener", layout="wide")
 
 EASTERN_TZ = ZoneInfo("America/New_York")
-APP_PREFERENCES_PATH = Path("data/app_preferences.json")
+# Resolved against this file, not the process working directory: a bare
+# "data/app_preferences.json" lands somewhere different depending on where streamlit
+# was launched from, so preferences appeared to reset when the app was started from
+# another folder.
+APP_PREFERENCES_PATH = Path(__file__).resolve().parent / "data" / "app_preferences.json"
 DEFAULT_PREFERENCES = {
     "fixed_risk": 250.0,
     "min_volume": 50,
@@ -44,17 +49,18 @@ DEFAULT_PREFERENCES = {
     "auto_refresh_enabled": False,
     "refresh_unit": "minutes",
     "refresh_interval": 15,
-    "intraday_mode": "Both",
     "intraday_universe": "S&P 100",
     "intraday_custom_tickers": "",
     "intraday_min_price": 5.0,
     "intraday_max_price": 1000.0,
-    "intraday_min_relative_volume": 0.05,
-    "intraday_min_day_change_pct": 0.5,
-    "intraday_max_spread_pct": 1.0,
+    # 1.0x means "normal volume for this time of day". The old 0.05 default was
+    # compensating for a relative-volume calculation that compared a partial session
+    # against a whole one; that maths is fixed, so the threshold means what it says.
+    "intraday_min_relative_volume": 1.0,
+    "intraday_min_avg_dollar_volume_m": 10.0,
     "intraday_include_shorts": True,
-    "intraday_use_rsi_confirmation": True,
-    "intraday_use_trend_confirmation": True,
+    "intraday_use_higher_timeframes": True,
+    "intraday_use_relative_strength": True,
     "intraday_auto_refresh_enabled": False,
     "intraday_refresh_interval": 15,
 }
@@ -103,14 +109,32 @@ RESULT_COLUMN_GUIDE = [
     ("as_of", "When the option snapshot was parsed, shown in Eastern Time.", "2026-04-27 10:22:26 EDT"),
 ]
 INTRADAY_COLUMN_GUIDE = [
-    ("rsi14", "Momentum oscillator from 0 to 100. Above 50 supports bullish momentum; below 50 supports bearish momentum. Extreme readings can favor mean reversion.", "Bullish momentum: 50-70. Oversold: below 30. Overbought: above 70."),
-    ("ema9", "Fast intraday exponential moving average. It reacts quicker than EMA20 and helps show short-term direction.", "Bullish momentum prefers price >= EMA9 >= EMA20."),
-    ("ema20", "Slower intraday exponential moving average. It gives the fast EMA a trend baseline.", "Bearish momentum prefers price <= EMA9 <= EMA20."),
-    ("macd", "Difference between EMA12 and EMA26. Positive means short-term price trend is above the slower trend; negative means below.", "MACD above signal is bullish; below signal is bearish."),
-    ("macd_signal", "EMA9 of MACD. Use it as the comparison line for MACD.", "MACD crossing above signal supports bullish momentum."),
-    ("macd_histogram", "MACD minus MACD signal. This is the quickest MACD read: positive favors bullish momentum, negative favors bearish momentum.", "Rising positive histogram means momentum is strengthening."),
-    ("vwap", "Volume-weighted average price for the current intraday session. Price above VWAP favors bullish acceptance; below VWAP favors bearish acceptance.", "Longs prefer price above VWAP; shorts prefer price below VWAP."),
-    ("signal_reason", "Plain-English summary of why the row became a candidate, watch, or avoid signal.", "May mention RSI, EMA/MACD/VWAP, spread, or volume."),
+    ("trade_signal", "The decision. STRONG_BUY / STRONG_SHORT need a 70+ score and higher-timeframe confirmation; BUY_CANDIDATE / SHORT_CANDIDATE need 45+; WATCH_ONLY is a setup a veto downgraded; AVOID is unusable.", "A veto always downgrades rather than hides, so the reason stays visible."),
+    ("dominant", "Which direction the weighted components favour: LONG, SHORT, or NEUTRAL.", "A suppressed playbook casts no vote."),
+    ("total_score", "Momentum + reversion (regime-weighted) + breakout + confluence + structure + relative strength.", "45 is actionable, 70 is strong. Structure can subtract."),
+    ("regime", "Trend strength read from ADX, deciding which playbook is trusted. TREND favours momentum, RANGE favours mean reversion, MIXED blends them.", "ADX 25+ is TREND, 18- is RANGE, between is MIXED."),
+    ("suggested_entry", "Last completed bar's close. Signals never use the still-forming candle, so this does not move until the bar closes.", "182.45"),
+    ("suggested_stop", "Entry minus the stop distance, which is the widest of 2.5xATR, 0.50% of price, and 8x the round-trip cost.", "178.20"),
+    ("suggested_target", "1.5x the stop distance from entry. Reward:risk is fixed, so a wider stop widens the target.", "188.83"),
+    ("stop_pct", "Stop distance as a percent of entry.", "2.33"),
+    ("rr_ratio", "Reward to risk. Always 1.5 by construction.", "1.5"),
+    ("cost_pct", "Estimated round-trip transaction cost as a percent of price. Uses the live quoted spread when available, otherwise a deliberately pessimistic liquidity tier.", "0.08"),
+    ("cost_ratio", "Cost as a fraction of the risk taken. This is the drag charged against every trade before any edge is counted.", "0.03"),
+    ("model_prob", "The trained model's P(target before stop), when a model is active. It can only veto, never promote.", "0.47"),
+    ("required_prob", "Cost-adjusted breakeven win rate plus a margin. Below this an otherwise-actionable signal is downgraded.", "0.44"),
+    ("mtf_confluence", "Higher-timeframe agreement. FULL needs both the hourly and daily trend present AND agreeing; a NEUTRAL timeframe is not confirmation.", "FULL +30, PARTIAL +15, UNCONFIRMED/CONFLICT/OPPOSED 0."),
+    ("sr_score", "Support/resistance scored relative to the trade direction. A level behind the trade shelters the stop; one ahead blocks the target.", "+25 at structure, -25 when blocked."),
+    ("blocked_ahead", "True when a level sits within 1.5xATR of the path to target. Downgrades an otherwise-actionable signal.", "True/False"),
+    ("extension_atr", "How many ATRs price sits from EMA20. A STRONG signal beyond 2.0 is downgraded rather than chased.", "1.4"),
+    ("rs_vs_spy", "Day change minus SPY's, in percentage points. Folded into the score itself, not added afterwards.", "+1.9 leads the market."),
+    ("relative_volume", "This bar's volume against the last 20 bars' average. Bar-for-bar, so it is comparable at any time of day.", "2.0 is twice normal volume."),
+    ("avg_dollar_volume", "20-bar average of close x volume. Sets the liquidity gate and the cost tier.", "A million shares of a $3 stock is not a million of a $300 stock."),
+    ("rsi14", "Momentum oscillator from 0 to 100. Above 50 supports bullish momentum; below 50 bearish. Extremes favour mean reversion instead.", "Momentum zone 40-65. Oversold below 30, overbought above 70."),
+    ("atr14", "Average true range: the unit every stop distance here is quoted in.", "1.85"),
+    ("adx14", "Wilder trend strength, roughly 0-100. Drives the regime gate.", "Above 25 trending, below 18 ranging."),
+    ("vwap", "Volume-weighted average price for the session so far.", "Longs prefer price above VWAP; shorts below."),
+    ("signal_reason", "Plain-English summary of why the row landed where it did, with the numbers in it.", "\"Long candidate (52pts)\" or \"hourly trend is SHORT - countertrend\"."),
+    ("risk_notes", "Component detail plus any warnings: liquidity, cost, blocked structure, short-selling risk.", "Reads as sentences, not codes."),
 ]
 
 
@@ -242,31 +266,58 @@ def _filter_by_signal(df: pd.DataFrame, selected_signals) -> pd.DataFrame:
 
 
 def _render_intraday_table(df: pd.DataFrame) -> None:
+    # Decision-first ordering: what the signal is, then the bracket it implies, then
+    # the score breakdown, then the raw indicators behind it.
     columns = [
         "rank",
         "ticker",
+        "trade_signal",
+        "dominant",
+        "total_score",
         "last_price",
         "day_change_pct",
-        "volume",
+        "suggested_entry",
+        "suggested_stop",
+        "suggested_target",
+        "stop_pct",
+        "target_pct",
+        "rr_ratio",
+        "cost_pct",
+        "cost_ratio",
+        "model_prob",
+        "required_prob",
+        "regime",
+        "adx14",
+        "momentum_score",
+        "reversion_score",
+        "breakout_score",
+        "mtf_score",
+        "mtf_confluence",
+        "sr_score",
+        "at_key_level",
+        "blocked_ahead",
+        "nearest_support",
+        "nearest_resistance",
+        "extension_atr",
+        "rs_vs_spy",
+        "rs_assessment",
         "relative_volume",
-        "open",
-        "high",
-        "low",
-        "prev_close",
-        "minute_price",
+        "avg_dollar_volume",
         "rsi14",
         "ema9",
         "ema20",
         "macd",
         "macd_signal",
         "macd_histogram",
+        "atr14",
         "vwap",
         "spread_pct",
-        "signal_mode",
-        "momentum_score",
-        "mean_reversion_score",
-        "total_score",
-        "trade_signal",
+        "volume",
+        "open",
+        "high",
+        "low",
+        "prev_close",
+        "market_phase",
         "signal_reason",
         "risk_notes",
         "as_of",
@@ -297,7 +348,7 @@ def _render_intraday_column_guide() -> None:
         st.caption("MACD quick read: compare MACD to signal, then use histogram for strength. Histogram above 0 favors bullish momentum; below 0 favors bearish momentum.")
 
 
-def _filter_intraday_results(df: pd.DataFrame, tickers, signals, modes, min_score: float) -> pd.DataFrame:
+def _filter_intraday_results(df: pd.DataFrame, tickers, signals, regimes, min_score: float) -> pd.DataFrame:
     if df.empty:
         return df
     filtered = df.copy()
@@ -305,8 +356,8 @@ def _filter_intraday_results(df: pd.DataFrame, tickers, signals, modes, min_scor
         filtered = filtered[filtered["ticker"].isin(tickers)]
     if signals and "trade_signal" in filtered.columns:
         filtered = filtered[filtered["trade_signal"].isin(signals)]
-    if modes and "signal_mode" in filtered.columns:
-        filtered = filtered[filtered["signal_mode"].isin(modes)]
+    if regimes and "regime" in filtered.columns:
+        filtered = filtered[filtered["regime"].isin(regimes)]
     if "total_score" in filtered.columns:
         filtered = filtered[filtered["total_score"].fillna(0) >= min_score]
     return filtered
@@ -362,12 +413,10 @@ def _render_intraday_page(settings, storage: Storage, preferences: dict) -> None
         st.header("Intraday Settings")
         key_status = "Loaded" if settings.polygon_api_key else "Missing"
         st.metric("Polygon API Key", key_status)
-        mode_options = ["Both", "Momentum", "Mean Reversion"]
-        intraday_mode = st.selectbox(
-            "Signal mode",
-            mode_options,
-            index=mode_options.index(preferences["intraday_mode"]) if preferences["intraday_mode"] in mode_options else 0,
-        )
+        # No "signal mode" selector any more. Momentum and mean reversion are no
+        # longer two scores the user picks between — an ADX regime gate weights them
+        # from measured trend strength, so choosing one by hand would be overriding
+        # the tape with a guess.
         universe_options = ["S&P 100", "Custom"]
         intraday_universe = st.radio(
             "Universe",
@@ -384,12 +433,42 @@ def _render_intraday_page(settings, storage: Storage, preferences: dict) -> None
         )
         min_price = st.number_input("Min price", min_value=0.0, max_value=10000.0, value=_bounded_number(preferences["intraday_min_price"], 0.0, 10000.0, 5.0), step=1.0)
         max_price = st.number_input("Max price", min_value=1.0, max_value=10000.0, value=_bounded_number(preferences["intraday_max_price"], 1.0, 10000.0, 1000.0), step=5.0)
-        min_relative_volume = st.number_input("Min relative volume", min_value=0.0, max_value=10.0, value=_bounded_number(preferences["intraday_min_relative_volume"], 0.0, 10.0, 0.05), step=0.01)
-        min_day_change_pct = st.number_input("Min day change %", min_value=0.0, max_value=20.0, value=_bounded_number(preferences["intraday_min_day_change_pct"], 0.0, 20.0, 0.5), step=0.1)
-        max_spread_pct = st.number_input("Max spread %", min_value=0.01, max_value=20.0, value=_bounded_number(preferences["intraday_max_spread_pct"], 0.01, 20.0, 1.0), step=0.1)
+        min_relative_volume = st.number_input(
+            "Min relative volume",
+            min_value=0.0,
+            max_value=10.0,
+            value=_bounded_number(preferences["intraday_min_relative_volume"], 0.0, 10.0, 1.0),
+            step=0.1,
+            help=(
+                "Bar-for-bar volume against the last 20 bars' average. 1.0 is normal "
+                "volume for this time of day, 2.0 is twice normal."
+            ),
+        )
+        min_avg_dollar_volume = st.number_input(
+            "Min avg $ volume (millions)",
+            min_value=0.0,
+            max_value=1000.0,
+            value=_bounded_number(preferences["intraday_min_avg_dollar_volume_m"], 0.0, 1000.0, 10.0),
+            step=1.0,
+            help=(
+                "Liquidity gate. Below a tenth of this the name is rejected outright; "
+                "below it the score is penalised. Also sets the transaction-cost tier "
+                "when no live quote is available."
+            ),
+        )
         include_shorts = st.checkbox("Include short candidates", value=bool(preferences["intraday_include_shorts"]))
-        use_rsi_confirmation = st.checkbox("Use RSI confirmation", value=bool(preferences["intraday_use_rsi_confirmation"]))
-        use_trend_confirmation = st.checkbox("Use EMA/MACD/VWAP confirmation", value=bool(preferences["intraday_use_trend_confirmation"]))
+        use_higher_timeframes = st.checkbox(
+            "Require higher-timeframe confirmation",
+            value=bool(preferences["intraday_use_higher_timeframes"]),
+            help=(
+                "Score the hourly and daily trend and the support/resistance map. "
+                "Full credit needs both timeframes present and agreeing."
+            ),
+        )
+        use_relative_strength = st.checkbox(
+            "Score relative strength vs SPY",
+            value=bool(preferences["intraday_use_relative_strength"]),
+        )
         st.subheader("Auto Refresh")
         st.session_state.intraday_auto_refresh = st.checkbox(
             "Auto-refresh during market hours",
@@ -417,17 +496,15 @@ def _render_intraday_page(settings, storage: Storage, preferences: dict) -> None
     try:
         _save_app_preferences(
             {
-                "intraday_mode": intraday_mode,
                 "intraday_universe": intraday_universe,
                 "intraday_custom_tickers": intraday_custom_tickers,
                 "intraday_min_price": float(min_price),
                 "intraday_max_price": float(max_price),
                 "intraday_min_relative_volume": float(min_relative_volume),
-                "intraday_min_day_change_pct": float(min_day_change_pct),
-                "intraday_max_spread_pct": float(max_spread_pct),
+                "intraday_min_avg_dollar_volume_m": float(min_avg_dollar_volume),
                 "intraday_include_shorts": bool(include_shorts),
-                "intraday_use_rsi_confirmation": bool(use_rsi_confirmation),
-                "intraday_use_trend_confirmation": bool(use_trend_confirmation),
+                "intraday_use_higher_timeframes": bool(use_higher_timeframes),
+                "intraday_use_relative_strength": bool(use_relative_strength),
                 "intraday_auto_refresh_enabled": bool(st.session_state.intraday_auto_refresh),
                 "intraday_refresh_interval": int(intraday_refresh_interval),
             }
@@ -435,27 +512,36 @@ def _render_intraday_page(settings, storage: Storage, preferences: dict) -> None
     except OSError as exc:
         st.warning(f"Could not save intraday settings: {exc}")
 
+    # Market data for this page comes from Yahoo and needs no key. Polygon is used
+    # only to upgrade the estimated transaction cost to a real quoted spread, so its
+    # absence degrades the ranking slightly rather than blocking the scan.
     if not settings.polygon_api_key:
-        st.error("Add POLYGON_API_KEY to .env, then restart Streamlit or rerun the app.")
+        st.info(
+            "No POLYGON_API_KEY set. Scanning still works on Yahoo data; transaction "
+            "cost falls back to conservative liquidity tiers instead of live spreads."
+        )
 
     request = IntradayScanRequest(
         tickers=selected_tickers,
-        mode=intraday_mode,
         min_price=float(min_price),
         max_price=float(max_price),
         min_relative_volume=float(min_relative_volume),
-        min_day_change_pct=float(min_day_change_pct),
-        max_spread_pct=float(max_spread_pct),
+        min_avg_dollar_volume=float(min_avg_dollar_volume) * 1_000_000,
         include_shorts=bool(include_shorts),
-        use_rsi_confirmation=bool(use_rsi_confirmation),
-        use_trend_confirmation=bool(use_trend_confirmation),
+        use_higher_timeframes=bool(use_higher_timeframes),
+        use_relative_strength=bool(use_relative_strength),
     )
 
     run_col, info_col = st.columns([1, 4])
     with run_col:
-        run_now = st.button("Run Intraday Scan", type="primary", disabled=not bool(settings.polygon_api_key) or not selected_tickers)
+        run_now = st.button("Run Intraday Scan", type="primary", disabled=not selected_tickers)
     with info_col:
-        st.write(f"Universe: {intraday_universe}, {len(selected_tickers)} tickers. Refresh target: {int(intraday_refresh_interval)} minutes.")
+        phase = current_market_phase()
+        st.write(
+            f"{phase_badge_color(phase)} {phase.replace('_', ' ').title()} · "
+            f"Universe: {intraday_universe}, {len(selected_tickers)} tickers · "
+            f"Refresh every {int(intraday_refresh_interval)} min."
+        )
 
     auto_count = None
     if st.session_state.intraday_auto_refresh:
@@ -463,9 +549,10 @@ def _render_intraday_page(settings, storage: Storage, preferences: dict) -> None
         if not is_regular_market_hours():
             st.info("Intraday auto-refresh is enabled and waiting for regular US market hours.")
 
+    # The tick-counter comparison is the idempotence guard: Streamlit reruns on any
+    # widget interaction, so without it every filter click would fire a fresh scan.
     auto_due = (
         st.session_state.intraday_auto_refresh
-        and bool(settings.polygon_api_key)
         and bool(selected_tickers)
         and is_regular_market_hours()
         and auto_count is not None
@@ -508,10 +595,10 @@ def _render_intraday_page(settings, storage: Storage, preferences: dict) -> None
             placeholder="All signals",
         )
         modes_filter = filter_col3.multiselect(
-            "Filter mode",
-            sorted(latest["signal_mode"].dropna().unique().tolist()) if not latest.empty else [],
+            "Filter regime",
+            sorted(latest["regime"].dropna().unique().tolist()) if not latest.empty else [],
             default=[],
-            placeholder="All modes",
+            placeholder="All regimes",
         )
         min_score_filter = filter_col4.number_input("Min score", min_value=0.0, max_value=100.0, value=0.0, step=5.0)
         filtered = _filter_intraday_results(latest, tickers_filter, signals_filter, modes_filter, float(min_score_filter))
@@ -656,25 +743,6 @@ def _parse_custom_tickers(value: str) -> list:
         seen.add(ticker)
         tickers.append(ticker)
     return tickers
-
-
-def _cleanup_pytest_cache_artifacts(root: Path = None) -> int:
-    repo_root = (root or Path.cwd()).resolve()
-    removed = 0
-    for path in repo_root.glob("pytest-cache-files-*"):
-        resolved = path.resolve()
-        if not resolved.is_dir():
-            continue
-        if resolved.parent != repo_root or not resolved.name.startswith("pytest-cache-files-"):
-            continue
-        shutil.rmtree(resolved, onerror=_make_writable_and_retry)
-        removed += 1
-    return removed
-
-
-def _make_writable_and_retry(function, path, _exc_info) -> None:
-    os.chmod(path, stat.S_IWRITE)
-    function(path)
 
 
 def main() -> None:
@@ -865,10 +933,6 @@ def main() -> None:
 
     if run_now or auto_due:
         with st.spinner("Scanning Polygon option chains..."):
-            try:
-                _cleanup_pytest_cache_artifacts()
-            except OSError as exc:
-                st.warning(f"Could not remove pytest cache folders: {exc}")
             summary = run_scan(settings, storage, scan_request)
         st.session_state.last_scan_at = datetime.now(EASTERN_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
         if auto_due:

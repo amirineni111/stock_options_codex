@@ -1,59 +1,158 @@
-from datetime import datetime
+"""
+The intraday equity lane: fetch -> indicators -> score -> rank.
+
+This is orchestration only. Indicator maths lives in ``indicators.py`` and the scoring
+engine in ``signals.py``, both of which the options lane also uses; the data client is
+``yahoo_client.py``. Previously all three were inlined here, which is why the option
+scorer could not reach the indicator functions and why nothing cross-checked them
+against the sibling repos.
+
+The scan runs in two phases, following the forex sibling:
+
+* **Phase 1 is parallel and pure** — fetch, compute indicators, produce a provisional
+  score. No shared state, no writes.
+* **Phase 2 is sequential** — anything needing cross-ticker state (relative strength
+  needs SPY, which needs every ticker's day change) and then a **full rescore** through
+  the same scorer. Rescoring rather than patching the result is what keeps the
+  displayed score, the decided score, and the trained score one number.
+"""
+from __future__ import annotations
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
-from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel
-import requests
 
+from . import indicators as ind
 from .config import AppSettings
+from .market_hours import (
+    current_market_phase,
+    market_open_today_utc,
+    minutes_since_open,
+    minutes_to_close,
+    opening_range_end_utc,
+)
 from .polygon import PolygonClient
+from .relative_strength import calculate_rs, rs_assessment, rs_bonus
+from .signals import MIN_TARGET_PCT, score_ticker
+from .timeutil import parse_ts, utc_now
+from .universe import normalize_symbol
+from .yahoo_client import DataFetchError, shared_client
 
-YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0"}
+# The benchmark relative strength is measured against. Fetched with the watchlist in
+# the same batched request, so it costs nothing extra.
+BENCHMARK = "SPY"
+
+# The timeframe signals are made on, and the two higher timeframes that must confirm.
+SIGNAL_INTERVAL = "15m"
+HOURLY_INTERVAL = "1h"
+DAILY_INTERVAL = "1d"
+
+# Parallel width for the pure compute phase. Deliberately modest: the point of
+# batching the fetches was to stop hammering Yahoo, and a wide pool here would only
+# help if fetching were still per-ticker, which it is not.
+MAX_WORKERS = 4
+
+# Minimum closed bars before a ticker is scoreable at all — enough to seed a
+# 26-period MACD and leave the ADX something to smooth.
+MIN_BARS = 30
+
+# A 15-minute regular session is 26 bars (09:30-16:00).
+SESSION_BARS = 26
+
+# Forward-testing in the stocks sibling found entries armed in the opening hour were
+# the biggest loss bucket (27% win rate, -0.33R per trade; removing them flipped the
+# whole system positive). Signals in this window still display — they are simply not
+# armed as trades.
+OPEN_CHOP_MINUTES = 60.0
 
 
 class IntradayScanRequest(BaseModel):
     tickers: List[str]
-    mode: str = "Both"
     min_price: float = 5.0
     max_price: float = 1000.0
-    min_relative_volume: float = 0.05
-    min_day_change_pct: float = 0.5
-    max_spread_pct: float = 1.0
+    # 1.0 is "normal volume for this time of day". The old default was 0.05, which was
+    # not a threshold at all — it was compensation for a relative-volume calculation
+    # that divided a partial session's volume by a whole prior session's. That maths is
+    # fixed (`indicators.calculate_relative_volume` is bar-for-bar now), so the
+    # threshold can mean what it says.
+    min_relative_volume: float = 1.0
+    min_avg_dollar_volume: float = 10_000_000.0
     include_shorts: bool = True
-    use_rsi_confirmation: bool = True
-    use_trend_confirmation: bool = True
-    rsi_period: int = 14
+    use_higher_timeframes: bool = True
+    use_relative_strength: bool = True
 
 
 class IntradayResult(BaseModel):
+    # `model_prob` / `model_mode` collide with pydantic's reserved `model_` prefix.
+    # The names are the ones the sibling repos and the DB columns use, so the guard is
+    # relaxed rather than the fields renamed.
+    model_config = {"protected_namespaces": ()}
+
     rank: int = 0
     ticker: str
     last_price: Optional[float] = None
     day_change_pct: Optional[float] = None
     volume: Optional[int] = None
     relative_volume: Optional[float] = None
+    avg_dollar_volume: Optional[float] = None
     open: Optional[float] = None
     high: Optional[float] = None
     low: Optional[float] = None
     prev_close: Optional[float] = None
-    minute_price: Optional[float] = None
     rsi14: Optional[float] = None
     ema9: Optional[float] = None
     ema20: Optional[float] = None
     macd: Optional[float] = None
     macd_signal: Optional[float] = None
     macd_histogram: Optional[float] = None
+    atr14: Optional[float] = None
+    adx14: Optional[float] = None
     vwap: Optional[float] = None
     spread_pct: Optional[float] = None
-    signal_mode: str = "None"
+
+    # Scoring
+    regime: str = "UNKNOWN"
+    dominant: str = "NEUTRAL"
     momentum_score: float = 0.0
-    mean_reversion_score: float = 0.0
+    reversion_score: float = 0.0
+    breakout_score: float = 0.0
+    mtf_score: float = 0.0
+    mtf_confluence: str = "NONE"
+    sr_score: float = 0.0
     total_score: float = 0.0
+
+    # Structure
+    at_key_level: bool = False
+    blocked_ahead: bool = False
+    nearest_support: Optional[float] = None
+    nearest_resistance: Optional[float] = None
+    extension_atr: Optional[float] = None
+
+    # Relative strength
+    rs_vs_spy: Optional[float] = None
+    rs_assessment: Optional[str] = None
+
+    # Trade levels and cost
+    suggested_entry: Optional[float] = None
+    suggested_stop: Optional[float] = None
+    suggested_target: Optional[float] = None
+    stop_dollars: Optional[float] = None
+    target_dollars: Optional[float] = None
+    stop_pct: Optional[float] = None
+    target_pct: Optional[float] = None
+    rr_ratio: Optional[float] = None
+    cost_pct: Optional[float] = None
+    cost_ratio: Optional[float] = None
+    model_prob: Optional[float] = None
+    required_prob: Optional[float] = None
+
     trade_signal: str = "WATCH_ONLY"
     signal_reason: str = ""
     risk_notes: str = ""
+    market_phase: Optional[str] = None
+    bar_timestamp: Optional[str] = None
     as_of: datetime
 
 
@@ -65,50 +164,81 @@ class IntradayScanSummary(BaseModel):
     errors: int = 0
 
 
-def run_intraday_scan(settings: AppSettings, request: IntradayScanRequest) -> Tuple[List[IntradayResult], IntradayScanSummary, List[Dict]]:
-    client = PolygonClient(settings.polygon_api_key, settings.request_timeout_seconds)
+def run_intraday_scan(
+    settings: AppSettings,
+    request: IntradayScanRequest,
+    now: Optional[datetime] = None,
+    client=None,
+) -> Tuple[List[IntradayResult], IntradayScanSummary, List[Dict[str, Any]]]:
+    now = now or utc_now()
+    client = client or shared_client
     summary = IntradayScanSummary(scanned=len(request.tickers))
-    logs: List[Dict] = []
+    logs: List[Dict[str, Any]] = []
+
+    tickers = [normalize_symbol(t) for t in request.tickers if t]
+    fetch_list = sorted(set(tickers) | {BENCHMARK})
+
+    # ── Phase 1: parallel, pure, no shared state ─────────────────────────────
+    frames = _fetch_frames(client, fetch_list, request, now, logs)
+    if not frames.get(SIGNAL_INTERVAL):
+        summary.errors = len(tickers)
+        return [], summary, logs
+
+    phase = current_market_phase(now)
+    open_utc = market_open_today_utc(now)
+    or_end_utc = opening_range_end_utc(now)
+    mins_to_close = minutes_to_close(now)
+    spreads = _observed_spreads(settings, tickers, logs, now)
+
+    contexts: Dict[str, Dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(_build_context, ticker, frames, request, open_utc, or_end_utc): ticker
+            for ticker in fetch_list
+        }
+        for future in as_completed(futures):
+            ticker = futures[future]
+            try:
+                context = future.result()
+                if context:
+                    contexts[ticker] = context
+            except Exception as exc:  # one bad ticker must never abort a scan
+                logs.append(_log(ticker, None, f"context build failed: {exc}", now))
+
+    # ── Phase 2: sequential — cross-ticker state, then a full rescore ────────
+    spy_change = (contexts.get(BENCHMARK) or {}).get("day_change_pct")
+
     results: List[IntradayResult] = []
-
-    provider = "polygon"
-    try:
-        snapshots = client.get_stock_snapshots(request.tickers)
-    except Exception as exc:
-        if "Polygon API error 403" not in str(exc):
-            summary.errors = len(request.tickers)
-            return [], summary, [{"ticker": "ALL", "error": str(exc), "created_at": datetime.utcnow().isoformat()}]
-        provider = "yahoo"
-        snapshots, fallback_logs = _fetch_yahoo_intraday_snapshots(request.tickers, request.rsi_period)
-        logs.extend(fallback_logs)
-    else:
-        if request.use_rsi_confirmation or request.use_trend_confirmation:
-            indicator_logs = _enrich_snapshots_with_yahoo_indicators(snapshots, request.rsi_period)
-            logs.extend(indicator_logs)
-
-    seen = set()
-    for snapshot in snapshots:
-        ticker = (snapshot.get("ticker") or "").upper()
-        if ticker:
-            seen.add(ticker)
+    for ticker in tickers:
+        context = contexts.get(ticker)
+        if context is None:
+            summary.errors += 1
+            logs.append(_log(ticker, None, "no usable bars returned", now))
+            continue
         try:
-            result = score_intraday_snapshot(snapshot, request)
-            results.append(result)
-            if result.trade_signal == "AVOID":
-                summary.avoid += 1
-            elif result.trade_signal == "WATCH_ONLY":
-                summary.watch += 1
-            else:
-                summary.accepted += 1
-            logs.append({"ticker": ticker, "signal": result.trade_signal, "error": None, "created_at": result.as_of.isoformat(), "provider": provider})
+            result = _score_context(
+                ticker=ticker,
+                context=context,
+                request=request,
+                spy_change=spy_change,
+                phase=phase,
+                mins_to_close=mins_to_close,
+                observed_spread_pct=spreads.get(ticker),
+                now=now,
+            )
         except Exception as exc:
             summary.errors += 1
-            logs.append({"ticker": ticker or "UNKNOWN", "signal": None, "error": str(exc), "created_at": datetime.utcnow().isoformat(), "provider": provider})
+            logs.append(_log(ticker, None, str(exc), now))
+            continue
 
-    missing = [ticker for ticker in request.tickers if ticker.upper() not in seen]
-    for ticker in missing:
-        summary.errors += 1
-        logs.append({"ticker": ticker.upper(), "signal": None, "error": "No snapshot returned", "created_at": datetime.utcnow().isoformat(), "provider": provider})
+        results.append(result)
+        if result.trade_signal == "AVOID":
+            summary.avoid += 1
+        elif result.trade_signal == "WATCH_ONLY":
+            summary.watch += 1
+        else:
+            summary.accepted += 1
+        logs.append(_log(ticker, result.trade_signal, None, now))
 
     results.sort(key=lambda item: item.total_score, reverse=True)
     for index, result in enumerate(results, start=1):
@@ -116,559 +246,368 @@ def run_intraday_scan(settings: AppSettings, request: IntradayScanRequest) -> Tu
     return results, summary, logs
 
 
-def _fetch_yahoo_intraday_snapshots(tickers: List[str], rsi_period: int = 14) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    snapshots = []
-    logs = [{"ticker": "ALL", "signal": None, "error": "Polygon stock snapshots denied; using Yahoo Finance delayed chart fallback", "created_at": datetime.utcnow().isoformat(), "provider": "yahoo"}]
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(_fetch_yahoo_snapshot, ticker, rsi_period): ticker for ticker in tickers}
-        for future in as_completed(futures):
-            ticker = futures[future]
-            try:
-                snapshots.append(future.result())
-            except Exception as exc:
-                logs.append({"ticker": ticker.upper(), "signal": None, "error": str(exc), "created_at": datetime.utcnow().isoformat(), "provider": "yahoo"})
-    return snapshots, logs
+# ── Phase 1 helpers ──────────────────────────────────────────────────────────
 
 
-def _enrich_snapshots_with_yahoo_indicators(snapshots: List[Dict[str, Any]], period: int) -> List[Dict[str, Any]]:
-    logs = []
-    by_ticker = {(snapshot.get("ticker") or "").upper(): snapshot for snapshot in snapshots if snapshot.get("ticker")}
-    indicator_keys = ("rsi14", "ema9", "ema20", "macd", "macd_signal", "macd_histogram", "vwap")
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(_fetch_yahoo_snapshot, ticker, period): ticker for ticker in by_ticker}
-        for future in as_completed(futures):
-            ticker = futures[future]
-            try:
-                yahoo_snapshot = future.result()
-                for key in indicator_keys:
-                    value = _first_float(yahoo_snapshot.get(key))
-                    if value is not None:
-                        by_ticker[ticker][key] = value
-            except Exception as exc:
-                logs.append(
-                    {
-                        "ticker": ticker,
-                        "signal": None,
-                        "error": f"technical indicators unavailable from Yahoo: {exc}",
-                        "created_at": datetime.utcnow().isoformat(),
-                        "provider": "yahoo",
-                    }
-                )
-    return logs
+def _fetch_frames(
+    client,
+    tickers: List[str],
+    request: IntradayScanRequest,
+    now: datetime,
+    logs: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+    """
+    At most three batched requests per scan, regardless of watchlist size.
+
+    The higher timeframes are skipped entirely when confirmation is off, and they are
+    TTL-cached inside the client, so a steady-state auto-refresh usually costs exactly
+    one intraday fetch. The version this replaced issued one request *per ticker* —
+    and did so even when Polygon had already answered.
+    """
+    wanted = [SIGNAL_INTERVAL]
+    if request.use_higher_timeframes:
+        wanted += [HOURLY_INTERVAL, DAILY_INTERVAL]
+
+    frames: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    for interval in wanted:
+        try:
+            frames[interval] = client.get_bars(tickers, interval, now=now)
+        except DataFetchError as exc:
+            frames[interval] = {}
+            logs.append(_log("ALL", None, f"{interval} fetch failed: {exc}", now))
+    return frames
 
 
-def _fetch_yahoo_snapshot(ticker: str, rsi_period: int = 14) -> Dict[str, Any]:
-    response = requests.get(
-        YAHOO_CHART_URL.format(ticker=ticker.upper()),
-        params={"range": "5d", "interval": "15m", "includePrePost": "false"},
-        headers=YAHOO_HEADERS,
-        timeout=15,
+def _build_context(
+    ticker: str,
+    frames: Dict[str, Dict[str, List[Dict[str, Any]]]],
+    request: IntradayScanRequest,
+    open_utc: Optional[datetime],
+    or_end_utc: Optional[datetime],
+) -> Optional[Dict[str, Any]]:
+    """
+    Everything the scorer needs for one ticker, from already-fetched bars.
+
+    Returned as a plain dict — the ``ctx`` pattern — so phase 2 can re-run the scorer
+    against identical inputs rather than trying to patch a finished result.
+    """
+    bars = (frames.get(SIGNAL_INTERVAL) or {}).get(ticker) or []
+    if len(bars) < MIN_BARS:
+        return None
+
+    values = ind.compute_all(bars)
+    last_bar = bars[-1]
+    close = last_bar.get("close")
+
+    day_bars = _todays_bars(bars, open_utc)
+    # Day extremes exclude the bar being scored, so the extreme can actually be broken
+    # by it. Including it makes every close a new day high by definition and the
+    # breakout component never fires.
+    prior_day_bars = day_bars[:-1] if len(day_bars) > 1 else []
+    day_high, day_low = ind.range_high_low(prior_day_bars, open_utc)
+    or_high, or_low = ind.window_high_low(bars, open_utc, or_end_utc)
+
+    prev_close = _prev_session_close(bars, open_utc)
+    day_change_pct = (
+        round((close - prev_close) / prev_close * 100, 4)
+        if close is not None and prev_close
+        else None
     )
-    response.raise_for_status()
-    payload = response.json()
-    result = ((payload.get("chart") or {}).get("result") or [None])[0]
-    if not result:
-        raise RuntimeError("Yahoo Finance returned no chart result")
-    return _yahoo_chart_to_snapshot(ticker, result, rsi_period)
 
+    hourly_direction = daily_direction = None
+    sr_levels: List[Dict[str, Any]] = []
+    if request.use_higher_timeframes:
+        hourly_bars = (frames.get(HOURLY_INTERVAL) or {}).get(ticker) or []
+        daily_bars = (frames.get(DAILY_INTERVAL) or {}).get(ticker) or []
+        hourly_direction = ind.compute_trend_direction(hourly_bars) if hourly_bars else None
+        daily_direction = ind.compute_trend_direction(daily_bars) if daily_bars else None
+        # Structure comes off the hourly frame: 15m pivots are noise, and daily pivots
+        # are too far away to constrain a trade inside one session.
+        sr_levels = ind.detect_sr_levels(hourly_bars) if hourly_bars else []
 
-def _yahoo_chart_to_snapshot(ticker: str, result: Dict[str, Any], rsi_period: int = 14) -> Dict[str, Any]:
-    meta = result.get("meta") or {}
-    timestamps = result.get("timestamp") or []
-    quote = (((result.get("indicators") or {}).get("quote") or [{}])[0]) or {}
-    timezone = ZoneInfo(meta.get("exchangeTimezoneName") or "America/New_York")
-    rows = []
-    for index, timestamp in enumerate(timestamps):
-        close = _list_value(quote.get("close"), index)
-        if close is None:
-            continue
-        rows.append(
-            {
-                "time": datetime.fromtimestamp(timestamp, tz=timezone),
-                "open": _list_value(quote.get("open"), index),
-                "high": _list_value(quote.get("high"), index),
-                "low": _list_value(quote.get("low"), index),
-                "close": close,
-                "volume": _list_value(quote.get("volume"), index) or 0,
-            }
-        )
-    if not rows:
-        raise RuntimeError("Yahoo Finance returned no usable 15-minute bars")
+    values.update(
+        {"day_high": day_high, "day_low": day_low, "or_high": or_high, "or_low": or_low}
+    )
 
-    latest_day = rows[-1]["time"].date()
-    today_rows = [row for row in rows if row["time"].date() == latest_day]
-    previous_rows = [row for row in rows if row["time"].date() < latest_day]
-    if not today_rows:
-        today_rows = rows[-1:]
-    prev_close = _first_float(meta.get("previousClose"))
-    if previous_rows:
-        prev_close = previous_rows[-1]["close"]
-    prev_volume = sum(int(row["volume"] or 0) for row in previous_rows if row["time"].date() == (previous_rows[-1]["time"].date() if previous_rows else latest_day))
-
-    last = today_rows[-1]
-    day_volume = sum(int(row["volume"] or 0) for row in today_rows)
-    closes = [row["close"] for row in rows if row["close"] is not None]
-    macd, macd_signal, macd_histogram = _calculate_macd(closes)
     return {
-        "ticker": ticker.upper(),
-        "todaysChangePerc": ((last["close"] - prev_close) / prev_close * 100.0) if prev_close else None,
-        "day": {
-            "o": today_rows[0]["open"],
-            "h": max(row["high"] for row in today_rows if row["high"] is not None),
-            "l": min(row["low"] for row in today_rows if row["low"] is not None),
-            "c": last["close"],
-            "v": day_volume,
-        },
-        "prevDay": {"c": prev_close, "v": prev_volume},
-        "min": {"c": last["close"]},
-        "lastTrade": {"p": last["close"]},
-        "lastQuote": {},
-        "rsi14": _calculate_rsi(closes, rsi_period),
-        "ema9": _calculate_ema(closes, 9),
-        "ema20": _calculate_ema(closes, 20),
-        "macd": macd,
-        "macd_signal": macd_signal,
-        "macd_histogram": macd_histogram,
-        "vwap": _calculate_vwap(today_rows),
+        "indicators": values,
+        "last": close,
+        "day_change_pct": day_change_pct,
+        "prev_close": prev_close,
+        "volume": int(last_bar.get("volume") or 0),
+        "vwap": ind.calculate_vwap(day_bars),
+        "avg_dollar_volume": values.get("avg_dollar_volume"),
+        "hourly_direction": hourly_direction,
+        "daily_direction": daily_direction,
+        "sr_levels": sr_levels,
+        "bar_timestamp": last_bar.get("timestamp"),
+        "session_open": day_bars[0].get("open") if day_bars else None,
+        "session_high": max((b["high"] for b in day_bars if b.get("high") is not None), default=None),
+        "session_low": min((b["low"] for b in day_bars if b.get("low") is not None), default=None),
     }
 
 
-def score_intraday_snapshot(snapshot: Dict[str, Any], request: IntradayScanRequest) -> IntradayResult:
-    ticker = (snapshot.get("ticker") or "").upper()
-    day = snapshot.get("day") or {}
-    prev_day = snapshot.get("prevDay") or {}
-    minute = snapshot.get("min") or {}
-    last_trade = snapshot.get("lastTrade") or {}
-    last_quote = snapshot.get("lastQuote") or {}
+def _todays_bars(
+    bars: List[Dict[str, Any]],
+    open_utc: Optional[datetime],
+) -> List[Dict[str, Any]]:
+    """
+    Bars from today's open onward. Falls back to the last session's worth when the
+    market is closed, so a weekend scan still works against Friday's tape.
+    """
+    if open_utc is None:
+        return bars[-SESSION_BARS:]
+    selected = [b for b in bars if (parse_ts(b.get("timestamp")) or open_utc) >= open_utc]
+    return selected or bars[-SESSION_BARS:]
 
-    last_price = _first_float(last_trade.get("p"), minute.get("c"), day.get("c"), prev_day.get("c"))
-    open_price = _first_float(day.get("o"))
-    high = _first_float(day.get("h"))
-    low = _first_float(day.get("l"))
-    prev_close = _first_float(prev_day.get("c"))
-    minute_price = _first_float(minute.get("c"))
-    rsi14 = _first_float(snapshot.get("rsi14"), snapshot.get("rsi"))
-    ema9 = _first_float(snapshot.get("ema9"))
-    ema20 = _first_float(snapshot.get("ema20"))
-    macd = _first_float(snapshot.get("macd"))
-    macd_signal = _first_float(snapshot.get("macd_signal"))
-    macd_histogram = _first_float(snapshot.get("macd_histogram"), snapshot.get("macd_hist"))
-    vwap = _first_float(snapshot.get("vwap"))
-    volume = _first_int(day.get("v"))
-    prev_volume = _first_int(prev_day.get("v"))
-    day_change_pct = _first_float(snapshot.get("todaysChangePerc"))
-    if day_change_pct is None and last_price is not None and prev_close:
-        day_change_pct = ((last_price - prev_close) / prev_close) * 100.0
-    relative_volume = (volume / prev_volume) if volume is not None and prev_volume else None
-    spread_pct = _spread_pct(last_quote, last_price)
 
-    momentum_score, momentum_side, momentum_reason = _momentum(
-        request,
-        last_price,
-        open_price,
-        day_change_pct,
-        relative_volume,
-        minute_price,
-        rsi14,
-        ema9,
-        ema20,
-        macd_histogram,
-        vwap,
-    )
-    reversion_score, reversion_side, reversion_reason = _mean_reversion(
-        request,
-        last_price,
-        high,
-        low,
-        day_change_pct,
-        relative_volume,
-        rsi14,
-    )
+def _prev_session_close(
+    bars: List[Dict[str, Any]],
+    open_utc: Optional[datetime],
+) -> Optional[float]:
+    """Last close strictly before today's open — the correct base for day change."""
+    if open_utc is None:
+        return bars[-2]["close"] if len(bars) >= 2 else None
+    prior = [b for b in bars if (parse_ts(b.get("timestamp")) or open_utc) < open_utc]
+    return prior[-1]["close"] if prior else None
 
-    mode = request.mode
-    candidates = []
-    if mode in {"Momentum", "Both"}:
-        candidates.append(("Momentum", momentum_score, momentum_side, momentum_reason))
-    if mode in {"Mean Reversion", "Both"}:
-        candidates.append(("Mean Reversion", reversion_score, reversion_side, reversion_reason))
-    signal_mode, total_score, side, signal_reason = max(candidates, key=lambda item: item[1]) if candidates else ("None", 0.0, "watch", "No mode selected")
 
-    trade_signal, final_reason, risk_notes = _classify_signal(
-        request=request,
-        side=side,
-        signal_reason=signal_reason,
-        last_price=last_price,
-        volume=volume,
-        relative_volume=relative_volume,
-        day_change_pct=day_change_pct,
-        spread_pct=spread_pct,
-    )
-    if trade_signal in {"WATCH_ONLY", "AVOID"}:
-        total_score = min(total_score, 49.0 if trade_signal == "WATCH_ONLY" else 0.0)
+def _observed_spreads(
+    settings: AppSettings,
+    tickers: List[str],
+    logs: List[Dict[str, Any]],
+    now: datetime,
+) -> Dict[str, Optional[float]]:
+    """
+    Real bid/ask spread percentages from Polygon, when the plan allows it.
+
+    A measured spread always beats a liquidity-tier estimate, and it is one batched
+    call. When it is unavailable the scorer falls back to the tiers, which are
+    deliberately pessimistic — so losing this degrades the ranking, never the safety.
+    """
+    if not settings.polygon_api_key or not tickers:
+        return {}
+    try:
+        client = PolygonClient(settings.polygon_api_key, settings.request_timeout_seconds)
+        snapshots = client.get_stock_snapshots(tickers)
+    except Exception as exc:
+        logs.append(_log("ALL", None, f"quote spreads unavailable, using cost tiers: {exc}", now))
+        return {}
+
+    spreads: Dict[str, Optional[float]] = {}
+    for snapshot in snapshots:
+        ticker = normalize_symbol(snapshot.get("ticker") or "")
+        quote = snapshot.get("lastQuote") or {}
+        bid = ind._first_float(quote.get("p"), quote.get("bid"))
+        ask = ind._first_float(quote.get("P"), quote.get("ask"))
+        if bid is None or ask is None or ask <= 0:
+            continue
+        mid = (bid + ask) / 2.0
+        if mid > 0:
+            spreads[ticker] = round((ask - bid) / mid * 100, 4)
+    return spreads
+
+
+# ── Phase 2 helper ───────────────────────────────────────────────────────────
+
+
+def _score_context(
+    ticker: str,
+    context: Dict[str, Any],
+    request: IntradayScanRequest,
+    spy_change: Optional[float],
+    phase: Optional[str],
+    mins_to_close: Optional[float],
+    observed_spread_pct: Optional[float],
+    now: datetime,
+) -> IntradayResult:
+    """
+    Score once to learn the direction, then rescore with relative strength folded in.
+
+    Two passes rather than one because the bonus depends on the direction and the
+    direction depends on the score. Adding the bonus to the finished total instead
+    would leave the displayed and the decided score disagreeing by up to 10 points —
+    more than the gap between WATCH_ONLY and an actionable candidate.
+    """
+    values = context["indicators"]
+
+    def _score(strength_bonus: float, model_prob: Optional[float] = None) -> Dict[str, Any]:
+        return score_ticker(
+            ticker=ticker,
+            last=context["last"],
+            avg_dollar_volume=context["avg_dollar_volume"],
+            indicators=values,
+            phase=phase,
+            minutes_to_close=mins_to_close,
+            min_avg_dollar_volume=request.min_avg_dollar_volume,
+            hourly_direction=context["hourly_direction"],
+            daily_direction=context["daily_direction"],
+            sr_levels=context["sr_levels"],
+            observed_spread_pct=observed_spread_pct,
+            model_prob=model_prob,
+            strength_bonus=strength_bonus,
+        )
+
+    base = _score(0.0)
+
+    rs = assessment = None
+    bonus = 0.0
+    if request.use_relative_strength:
+        rs = calculate_rs(context["day_change_pct"], spy_change)
+        assessment = rs_assessment(rs)
+        bonus = rs_bonus(assessment, base["dominant"])
+
+    scored = _score(bonus) if bonus else base
+    scored = _apply_instrument_filters(scored, context, request)
 
     return IntradayResult(
         ticker=ticker,
-        last_price=_round(last_price),
-        day_change_pct=_round(day_change_pct),
-        volume=volume,
-        relative_volume=_round(relative_volume),
-        open=_round(open_price),
-        high=_round(high),
-        low=_round(low),
-        prev_close=_round(prev_close),
-        minute_price=_round(minute_price),
-        rsi14=_round(rsi14),
-        ema9=_round(ema9),
-        ema20=_round(ema20),
-        macd=_round(macd),
-        macd_signal=_round(macd_signal),
-        macd_histogram=_round(macd_histogram),
-        vwap=_round(vwap),
-        spread_pct=_round(spread_pct),
-        signal_mode=signal_mode,
-        momentum_score=round(momentum_score, 2),
-        mean_reversion_score=round(reversion_score, 2),
-        total_score=round(total_score, 2),
-        trade_signal=trade_signal,
-        signal_reason=final_reason,
-        risk_notes=risk_notes,
-        as_of=datetime.utcnow(),
+        last_price=_round(context["last"]),
+        day_change_pct=_round(context["day_change_pct"]),
+        volume=context["volume"],
+        relative_volume=_round(values.get("rel_volume")),
+        avg_dollar_volume=_round(context["avg_dollar_volume"]),
+        open=_round(context["session_open"]),
+        high=_round(context["session_high"]),
+        low=_round(context["session_low"]),
+        prev_close=_round(context["prev_close"]),
+        rsi14=_round(values.get("rsi14")),
+        ema9=_round(values.get("ema9")),
+        ema20=_round(values.get("ema20")),
+        macd=_round(values.get("macd")),
+        macd_signal=_round(values.get("macd_signal")),
+        macd_histogram=_round(values.get("macd_histogram")),
+        atr14=_round(values.get("atr14")),
+        adx14=_round(values.get("adx14")),
+        vwap=_round(context["vwap"]),
+        spread_pct=_round(observed_spread_pct),
+        regime=scored["regime"],
+        dominant=scored["dominant"],
+        momentum_score=scored["momentum_score"],
+        reversion_score=scored["reversion_score"],
+        breakout_score=scored["breakout_score"],
+        mtf_score=scored["mtf_score"],
+        mtf_confluence=scored["mtf_confluence"],
+        sr_score=scored["sr_score"],
+        total_score=scored["total_score"],
+        at_key_level=scored["at_key_level"],
+        blocked_ahead=scored["blocked_ahead"],
+        nearest_support=_round(scored["nearest_support"]),
+        nearest_resistance=_round(scored["nearest_resistance"]),
+        extension_atr=scored["extension_atr"],
+        rs_vs_spy=rs,
+        rs_assessment=assessment,
+        suggested_entry=scored["suggested_entry"],
+        suggested_stop=scored["suggested_stop"],
+        suggested_target=scored["suggested_target"],
+        stop_dollars=scored["stop_dollars"],
+        target_dollars=scored["target_dollars"],
+        stop_pct=scored["stop_pct"],
+        target_pct=scored["target_pct"],
+        rr_ratio=scored["rr_ratio"],
+        cost_pct=scored["cost_pct"],
+        cost_ratio=scored["cost_ratio"],
+        model_prob=scored["model_prob"],
+        required_prob=scored["required_prob"],
+        trade_signal=scored["trade_signal"],
+        signal_reason=scored["signal_reason"],
+        risk_notes=scored["risk_notes"],
+        market_phase=scored["market_phase"],
+        bar_timestamp=context["bar_timestamp"],
+        as_of=now,
     )
 
 
-def _momentum(
+def _apply_instrument_filters(
+    scored: Dict[str, Any],
+    context: Dict[str, Any],
     request: IntradayScanRequest,
-    last_price: Optional[float],
-    open_price: Optional[float],
-    day_change_pct: Optional[float],
-    relative_volume: Optional[float],
-    minute_price: Optional[float],
-    rsi14: Optional[float],
-    ema9: Optional[float],
-    ema20: Optional[float],
-    macd_histogram: Optional[float],
-    vwap: Optional[float],
-) -> Tuple[float, str, str]:
-    if last_price is None or open_price is None or day_change_pct is None:
-        return 0.0, "watch", "Missing price or day-change data"
-    bullish = day_change_pct >= request.min_day_change_pct and last_price >= open_price
-    bearish = request.include_shorts and day_change_pct <= -request.min_day_change_pct and last_price <= open_price
-    if not bullish and not bearish:
-        return 0.0, "watch", "Momentum conditions not met"
+) -> Dict[str, Any]:
+    """
+    Price band, shorts toggle, and relative volume.
 
-    direction = 1 if bullish else -1
-    side = "long" if bullish else "short"
-    rsi_score, rsi_reason, rsi_blocks = _momentum_rsi_score(side, rsi14, request.use_rsi_confirmation)
-    if rsi_blocks:
-        return 0.0, "watch", rsi_reason
-    technical_score, technical_reason, technical_blocks = _momentum_technical_score(
-        side,
-        last_price,
-        ema9,
-        ema20,
-        macd_histogram,
-        vwap,
-        request.use_trend_confirmation,
-    )
-    if technical_blocks:
-        return 0.0, "watch", technical_reason
+    These describe the *instrument* rather than the setup, so they are applied after
+    scoring: the score stays a property of the tape, and these downgrade rather than
+    delete so a filtered name still appears with a reason instead of vanishing.
+    """
+    last = context["last"]
+    rel_volume = context["indicators"].get("rel_volume")
 
-    change_score = min(abs(day_change_pct) / max(request.min_day_change_pct, 0.01), 3.0) / 3.0 * 25.0
-    relvol_score = min((relative_volume or 0.0) / max(request.min_relative_volume, 0.01), 3.0) / 3.0 * 20.0
-    open_score = min(abs(last_price - open_price) / max(open_price, 0.01) * 100.0, 2.0) / 2.0 * 15.0
-    minute_score = 10.0 if minute_price is not None and (last_price - minute_price) * direction >= 0 else 5.0
-    total = change_score + relvol_score + open_score + minute_score + rsi_score + technical_score
-    return total, side, f"{side} momentum: day change, price-vs-open, {rsi_reason}, and {technical_reason}"
+    if last is None:
+        return {**scored, "trade_signal": "AVOID", "signal_reason": "last price unavailable"}
+    if last < request.min_price or last > request.max_price:
+        return {
+            **scored,
+            "trade_signal": "AVOID",
+            "signal_reason": (
+                f"price ${last:,.2f} outside "
+                f"${request.min_price:,.0f}-${request.max_price:,.0f}"
+            ),
+        }
 
+    if scored["trade_signal"] in ("AVOID", "WATCH_ONLY"):
+        return scored
 
-def _mean_reversion(
-    request: IntradayScanRequest,
-    last_price: Optional[float],
-    high: Optional[float],
-    low: Optional[float],
-    day_change_pct: Optional[float],
-    relative_volume: Optional[float],
-    rsi14: Optional[float],
-) -> Tuple[float, str, str]:
-    if last_price is None or high is None or low is None or high <= low or day_change_pct is None:
-        return 0.0, "watch", "Missing range or day-change data"
-    range_position = (last_price - low) / (high - low)
-    oversold = day_change_pct <= -request.min_day_change_pct and range_position <= 0.30
-    overbought = request.include_shorts and day_change_pct >= request.min_day_change_pct and range_position >= 0.70
-    if not oversold and not overbought:
-        return 0.0, "watch", "Mean reversion conditions not met"
+    if scored["dominant"] == "SHORT" and not request.include_shorts:
+        return {
+            **scored,
+            "trade_signal": "WATCH_ONLY",
+            "signal_reason": "Short candidates are disabled in this scan",
+        }
 
-    side = "long" if oversold else "short"
-    rsi_score, rsi_reason, rsi_blocks = _reversion_rsi_score(side, rsi14, request.use_rsi_confirmation)
-    if rsi_blocks:
-        return 0.0, "watch", rsi_reason
+    if rel_volume is not None and rel_volume < request.min_relative_volume:
+        return {
+            **scored,
+            "trade_signal": "WATCH_ONLY",
+            "signal_reason": (
+                f"{scored['signal_reason']} - relative volume {rel_volume:.2f}x "
+                f"below {request.min_relative_volume:.2f}x"
+            ),
+        }
 
-    change_score = min(abs(day_change_pct) / max(request.min_day_change_pct, 0.01), 3.0) / 3.0 * 30.0
-    relvol_score = min((relative_volume or 0.0) / max(request.min_relative_volume, 0.01), 3.0) / 3.0 * 20.0
-    extension_score = (1.0 - range_position) * 30.0 if oversold else range_position * 30.0
-    total = change_score + relvol_score + extension_score + rsi_score
-    return total, side, f"{side} mean reversion: price extended near day {'low' if oversold else 'high'} and {rsi_reason}"
+    return scored
 
 
-def _momentum_rsi_score(side: str, rsi14: Optional[float], use_confirmation: bool) -> Tuple[float, str, bool]:
-    if not use_confirmation:
-        return 15.0, "RSI confirmation disabled", False
-    if rsi14 is None:
-        return 7.5, "RSI unavailable", False
-    if side == "long":
-        if 50.0 <= rsi14 <= 70.0:
-            return 15.0, f"RSI14 {rsi14:.1f} confirms bullish momentum", False
-        if 45.0 <= rsi14 < 50.0 or 70.0 < rsi14 <= 80.0:
-            return 7.5, f"RSI14 {rsi14:.1f} is a soft bullish confirmation", False
-        return 0.0, f"RSI14 {rsi14:.1f} does not confirm bullish momentum", True
-    if 30.0 <= rsi14 <= 50.0:
-        return 15.0, f"RSI14 {rsi14:.1f} confirms bearish momentum", False
-    if 20.0 <= rsi14 < 30.0 or 50.0 < rsi14 <= 55.0:
-        return 7.5, f"RSI14 {rsi14:.1f} is a soft bearish confirmation", False
-    return 0.0, f"RSI14 {rsi14:.1f} does not confirm bearish momentum", True
+def is_armable(result: IntradayResult, now: Optional[datetime] = None) -> Tuple[bool, str]:
+    """
+    Whether a signal should be forward-tested — separate from whether it displays.
+
+    Two gates, both ported with their evidence:
+
+    * **Opening chop.** Entries armed in the first hour were the biggest loss bucket in
+      the stocks sibling's forward test. They still display; they are not measured.
+    * **Thin edge.** A target under ``MIN_TARGET_PCT`` of entry measures the spread
+      rather than the signal, so recording its outcome would poison the training set
+      with noise labelled as skill.
+    """
+    if result.trade_signal in ("AVOID", "WATCH_ONLY"):
+        return False, "not actionable"
+    if result.suggested_stop is None or result.suggested_target is None:
+        return False, "no bracket"
+    since_open = minutes_since_open(now)
+    if since_open is not None and since_open < OPEN_CHOP_MINUTES:
+        return False, f"opening hour ({since_open:.0f} min since open)"
+    if (result.target_pct or 0.0) < MIN_TARGET_PCT:
+        return False, f"thin edge (target {result.target_pct:.2f}%)"
+    return True, ""
 
 
-def _reversion_rsi_score(side: str, rsi14: Optional[float], use_confirmation: bool) -> Tuple[float, str, bool]:
-    if not use_confirmation:
-        return 20.0, "RSI confirmation disabled", False
-    if rsi14 is None:
-        return 10.0, "RSI unavailable", False
-    if side == "long":
-        if rsi14 <= 30.0:
-            return 20.0, f"RSI14 {rsi14:.1f} confirms oversold conditions", False
-        if rsi14 <= 45.0:
-            return max(0.0, (45.0 - rsi14) / 15.0 * 20.0), f"RSI14 {rsi14:.1f} is mildly oversold", False
-        return 0.0, f"RSI14 {rsi14:.1f} is not oversold enough for long mean reversion", True
-    if rsi14 >= 70.0:
-        return 20.0, f"RSI14 {rsi14:.1f} confirms overbought conditions", False
-    if rsi14 >= 55.0:
-        return max(0.0, (rsi14 - 55.0) / 15.0 * 20.0), f"RSI14 {rsi14:.1f} is mildly overbought", False
-    return 0.0, f"RSI14 {rsi14:.1f} is not overbought enough for short mean reversion", True
+# ── Small helpers ────────────────────────────────────────────────────────────
 
 
-def _momentum_technical_score(
-    side: str,
-    last_price: Optional[float],
-    ema9: Optional[float],
-    ema20: Optional[float],
-    macd_histogram: Optional[float],
-    vwap: Optional[float],
-    use_confirmation: bool,
-) -> Tuple[float, str, bool]:
-    if not use_confirmation:
-        return 15.0, "EMA/MACD/VWAP confirmation disabled", False
-    checks = []
-    missing = []
-
-    if last_price is not None and ema9 is not None and ema20 is not None:
-        ema_aligned = last_price >= ema9 >= ema20 if side == "long" else last_price <= ema9 <= ema20
-        checks.append(("EMA9/EMA20", ema_aligned))
-    else:
-        missing.append("EMA")
-
-    if macd_histogram is not None:
-        macd_aligned = macd_histogram >= 0.0 if side == "long" else macd_histogram <= 0.0
-        checks.append(("MACD histogram", macd_aligned))
-    else:
-        missing.append("MACD")
-
-    if last_price is not None and vwap is not None:
-        vwap_aligned = last_price >= vwap if side == "long" else last_price <= vwap
-        checks.append(("VWAP", vwap_aligned))
-    else:
-        missing.append("VWAP")
-
-    if not checks:
-        return 7.5, "EMA/MACD/VWAP unavailable", False
-
-    aligned_count = sum(1 for _, aligned in checks if aligned)
-    if aligned_count == len(checks):
-        reason = "EMA/MACD/VWAP confirm momentum"
-        if missing:
-            reason = f"{reason}; missing {', '.join(missing)}"
-        return 15.0, reason, False
-    if aligned_count == 0 and len(checks) >= 2:
-        failed = ", ".join(name for name, _ in checks)
-        return 0.0, f"{failed} do not confirm {side} momentum", True
-
-    score = aligned_count / len(checks) * 15.0
-    aligned = ", ".join(name for name, is_aligned in checks if is_aligned)
-    failed = ", ".join(name for name, is_aligned in checks if not is_aligned)
-    reason = f"mixed EMA/MACD/VWAP confirmation"
-    if aligned:
-        reason = f"{reason}; aligned: {aligned}"
-    if failed:
-        reason = f"{reason}; weak: {failed}"
-    if missing:
-        reason = f"{reason}; missing: {', '.join(missing)}"
-    return score, reason, False
-
-
-def _calculate_rsi(closes: List[float], period: int = 14) -> Optional[float]:
-    if period <= 0 or len(closes) <= period:
-        return None
-    changes = []
-    for previous, current in zip(closes[:-1], closes[1:]):
-        change = current - previous
-        changes.append(change)
-    gains = [max(change, 0.0) for change in changes[:period]]
-    losses = [max(-change, 0.0) for change in changes[:period]]
-    average_gain = sum(gains) / period
-    average_loss = sum(losses) / period
-    for change in changes[period:]:
-        average_gain = ((average_gain * (period - 1)) + max(change, 0.0)) / period
-        average_loss = ((average_loss * (period - 1)) + max(-change, 0.0)) / period
-    if average_loss == 0:
-        return 100.0 if average_gain > 0 else 50.0
-    rs = average_gain / average_loss
-    return round(100.0 - (100.0 / (1.0 + rs)), 4)
-
-
-def _calculate_ema(closes: List[float], period: int) -> Optional[float]:
-    series = _calculate_ema_series(closes, period)
-    return series[-1] if series else None
-
-
-def _calculate_ema_series(values: List[float], period: int) -> List[Optional[float]]:
-    if period <= 0 or len(values) < period:
-        return []
-    series: List[Optional[float]] = [None] * len(values)
-    ema = sum(values[:period]) / period
-    series[period - 1] = ema
-    multiplier = 2.0 / (period + 1.0)
-    for index in range(period, len(values)):
-        ema = (values[index] - ema) * multiplier + ema
-        series[index] = ema
-    return series
-
-
-def _calculate_macd(closes: List[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    fast = _calculate_ema_series(closes, 12)
-    slow = _calculate_ema_series(closes, 26)
-    if not fast or not slow:
-        return None, None, None
-
-    macd_values = []
-    for fast_value, slow_value in zip(fast, slow):
-        if fast_value is not None and slow_value is not None:
-            macd_values.append(fast_value - slow_value)
-    if len(macd_values) < 9:
-        return None, None, None
-
-    signal = _calculate_ema(macd_values, 9)
-    macd = macd_values[-1]
-    if signal is None:
-        return None, None, None
-    return round(macd, 4), round(signal, 4), round(macd - signal, 4)
-
-
-def _calculate_vwap(rows: List[Dict[str, Any]]) -> Optional[float]:
-    total_price_volume = 0.0
-    total_volume = 0.0
-    for row in rows:
-        volume = _first_float(row.get("volume"))
-        if volume is None or volume <= 0:
-            continue
-        high = _first_float(row.get("high"))
-        low = _first_float(row.get("low"))
-        close = _first_float(row.get("close"))
-        if close is None:
-            continue
-        typical_price = (high + low + close) / 3.0 if high is not None and low is not None else close
-        total_price_volume += typical_price * volume
-        total_volume += volume
-    if total_volume <= 0:
-        return None
-    return round(total_price_volume / total_volume, 4)
-
-
-def _classify_signal(
-    request: IntradayScanRequest,
-    side: str,
-    signal_reason: str,
-    last_price: Optional[float],
-    volume: Optional[int],
-    relative_volume: Optional[float],
-    day_change_pct: Optional[float],
-    spread_pct: Optional[float],
-) -> Tuple[str, str, str]:
-    avoid = []
-    watch = []
-    risk = ["Decision-support only; no broker execution."]
-
-    if last_price is None:
-        avoid.append("last price unavailable")
-    elif last_price < request.min_price or last_price > request.max_price:
-        avoid.append("outside price range")
-    if volume is None:
-        watch.append("volume unavailable")
-    if relative_volume is None:
-        watch.append("relative volume unavailable")
-    elif relative_volume < request.min_relative_volume:
-        watch.append("relative volume below threshold")
-    if day_change_pct is None:
-        watch.append("day change unavailable")
-    elif abs(day_change_pct) < request.min_day_change_pct:
-        watch.append("day change below threshold")
-    if spread_pct is not None and spread_pct > request.max_spread_pct:
-        avoid.append("spread above threshold")
-    elif spread_pct is None:
-        risk.append("Bid/ask unavailable; verify execution quality.")
-    if side == "short" and not request.include_shorts:
-        avoid.append("short candidates disabled")
-
-    if avoid:
-        return "AVOID", "; ".join(avoid), " ".join(risk)
-    if watch or side == "watch":
-        return "WATCH_ONLY", "; ".join(watch or [signal_reason]), " ".join(risk)
-    if side == "long" and "mean reversion" in signal_reason:
-        return "MEAN_REVERSION_LONG", signal_reason, " ".join(risk)
-    if side == "short" and "mean reversion" in signal_reason:
-        risk.append("Short selling can create large losses; use only if approved and risk-controlled.")
-        return "MEAN_REVERSION_SHORT", signal_reason, " ".join(risk)
-    if side == "short":
-        risk.append("Short selling can create large losses; use only if approved and risk-controlled.")
-        return "SHORT_CANDIDATE", signal_reason, " ".join(risk)
-    return "BUY_CANDIDATE", signal_reason, " ".join(risk)
-
-
-def _spread_pct(last_quote: Dict[str, Any], last_price: Optional[float]) -> Optional[float]:
-    bid = _first_float(last_quote.get("p"), last_quote.get("bid"), last_quote.get("bid_price"))
-    ask = _first_float(last_quote.get("P"), last_quote.get("ask"), last_quote.get("ask_price"))
-    if bid is None or ask is None or ask <= 0:
-        return None
-    mid = (bid + ask) / 2.0
-    if mid <= 0:
-        return None
-    return ((ask - bid) / mid) * 100.0
-
-
-def _first_float(*values: Any) -> Optional[float]:
-    for value in values:
-        if value is None:
-            continue
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
-def _first_int(*values: Any) -> Optional[int]:
-    for value in values:
-        if value is None:
-            continue
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
-def _list_value(values, index: int):
-    if not values or index >= len(values):
-        return None
-    return values[index]
+def _log(
+    ticker: str,
+    signal: Optional[str],
+    error: Optional[str],
+    now: datetime,
+) -> Dict[str, Any]:
+    return {
+        "ticker": ticker,
+        "signal": signal,
+        "error": error,
+        "created_at": now.isoformat(),
+        "provider": "yahoo",
+    }
 
 
 def _round(value: Optional[float]) -> Optional[float]:

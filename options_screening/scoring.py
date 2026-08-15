@@ -1,12 +1,60 @@
+"""
+Contract filtering, scoring, and the decision context shown next to each row.
+
+The score here answers "is this contract well formed?" — liquid, tight, in the delta
+and DTE bands you asked for. It deliberately does **not** answer "will this trade make
+money"; the directional read comes from `signals.py` and the measured odds come from
+the model. Keeping the two separate is what lets the model veto without being able to
+promote something the filters already rejected.
+"""
+from __future__ import annotations
+
 from datetime import date
 import math
 from typing import List, Optional, Tuple
 
 from .models import MarketContext, OptionContract, RejectedContract, ScoredContract
+from .timeutil import exchange_date
+
+# ── Score component weights ──────────────────────────────────────────────────
+# Five components summing to 100. These are contract-quality weights, not edge
+# weights: liquidity and spread dominate because they are the two things that
+# reliably cost money on entry regardless of whether the directional call is right.
+_W_LIQUIDITY = 25.0
+_W_SPREAD = 25.0
+_W_DELTA = 20.0
+_W_EXPIRATION = 15.0
+_W_IV = 15.0
+
+# Volume and open interest stop earning score at 2x the configured minimum. Past
+# that, more open interest does not make a fill meaningfully easier, and letting it
+# keep scoring would rank mega-cap weeklies above everything else on size alone.
+_LIQUIDITY_SATURATION = 2.0
+_LIQUIDITY_VOLUME_SHARE = 10.0
+_LIQUIDITY_OI_SHARE = 15.0
+
+# ── Signal-stage floors ──────────────────────────────────────────────────────
+# The filter stage honours the user's thresholds exactly. The *signal* stage applies
+# these floors on top, so that loosening a filter to see more rows cannot silently
+# promote an unfillable contract to a candidate. They are floors, not overrides: a
+# stricter user setting always wins.
+_SIGNAL_MAX_SPREAD_PCT = 20.0
+_SIGNAL_MIN_VOLUME = 10
+_SIGNAL_MIN_OPEN_INTEREST = 100
+
+# The +/- move used for the scenario P&L columns.
+_SCENARIO_MOVE_PCT = 0.02
 
 
-def days_to_expiration(contract: OptionContract, today: date = None) -> int:
-    base = today or date.today()
+def days_to_expiration(contract: OptionContract, today: Optional[date] = None) -> int:
+    """
+    Calendar days to expiry, counted from the *exchange* date.
+
+    ``date.today()`` is the local date, which after 20:00 ET is already tomorrow in
+    UTC and disagreed with the DTE storage computed from a UTC timestamp — the same
+    contract carried two different DTEs in one row. Both now come from here.
+    """
+    base = today or exchange_date()
     return (contract.expiration_date - base).days
 
 
@@ -14,31 +62,47 @@ def score_contract(
     contract: OptionContract,
     settings,
     market_context: Optional[MarketContext] = None,
-) -> Tuple[ScoredContract, RejectedContract]:
-    rejection = _validate_contract(contract, settings, market_context)
+    today: Optional[date] = None,
+) -> Tuple[Optional[ScoredContract], Optional[RejectedContract]]:
+    """Returns exactly one of (scored, None) or (None, rejection)."""
+    today = today or exchange_date()
+    rejection = _validate_contract(contract, settings, market_context, today=today)
     if rejection:
         return None, rejection
 
     spread_pct = contract.spread_pct or 0.0
     abs_delta = abs(contract.delta or 0.0)
-    dte = days_to_expiration(contract)
+    dte = days_to_expiration(contract, today)
     iv = contract.implied_volatility or 0.0
     volume = contract.volume or 0
     oi = contract.open_interest or 0
     mid = contract.mid_price or 0.0
 
-    liquidity_score = min(25.0, (min(volume / max(settings.min_volume, 1), 2.0) / 2.0) * 10.0 + (min(oi / max(settings.min_open_interest, 1), 2.0) / 2.0) * 15.0)
+    volume_ratio = min(volume / max(settings.min_volume, 1), _LIQUIDITY_SATURATION) / _LIQUIDITY_SATURATION
+    oi_ratio = min(oi / max(settings.min_open_interest, 1), _LIQUIDITY_SATURATION) / _LIQUIDITY_SATURATION
+    liquidity_score = min(
+        _W_LIQUIDITY,
+        volume_ratio * _LIQUIDITY_VOLUME_SHARE + oi_ratio * _LIQUIDITY_OI_SHARE,
+    )
+    # An unavailable spread scores zero rather than being treated as tight. An
+    # unmeasured cost is not a zero cost, and scoring it as one is how a screener
+    # talks itself into contracts nobody is quoting.
     if contract.spread_pct is None:
         spread_score = 0.0
     else:
-        spread_score = max(0.0, 25.0 * (1.0 - spread_pct / settings.max_spread_pct))
+        spread_score = max(0.0, _W_SPREAD * (1.0 - spread_pct / settings.max_spread_pct))
+    # Delta and DTE score as triangles peaking at the middle of the requested band:
+    # the edges of a band are where you asked to stop looking, not where you wanted
+    # to be.
     delta_midpoint = (settings.min_abs_delta + settings.max_abs_delta) / 2.0
     delta_width = max((settings.max_abs_delta - settings.min_abs_delta) / 2.0, 0.01)
-    delta_score = max(0.0, 20.0 * (1.0 - abs(abs_delta - delta_midpoint) / delta_width))
+    delta_score = max(0.0, _W_DELTA * (1.0 - abs(abs_delta - delta_midpoint) / delta_width))
     dte_midpoint = (settings.min_days_to_expiration + settings.max_days_to_expiration) / 2.0
     dte_width = max((settings.max_days_to_expiration - settings.min_days_to_expiration) / 2.0, 1.0)
-    expiration_score = max(0.0, 15.0 * (1.0 - abs(dte - dte_midpoint) / dte_width))
-    iv_score = max(0.0, 15.0 * (1.0 - (iv - settings.min_iv) / max(settings.max_iv - settings.min_iv, 0.01)))
+    expiration_score = max(0.0, _W_EXPIRATION * (1.0 - abs(dte - dte_midpoint) / dte_width))
+    # Monotonically prefers cheaper IV within the band: for a long option, IV is the
+    # price paid, and the band's upper edge is the most expensive thing you allowed.
+    iv_score = max(0.0, _W_IV * (1.0 - (iv - settings.min_iv) / max(settings.max_iv - settings.min_iv, 0.01)))
 
     score = round(liquidity_score + spread_score + delta_score + expiration_score + iv_score, 2)
     max_contracts = int(settings.fixed_risk // (mid * 100)) if mid > 0 else 0
@@ -48,7 +112,9 @@ def score_contract(
     else:
         breakeven = contract.strike_price - mid
 
-    decision_context = _decision_context(contract, settings, market_context, breakeven, max_contracts, premium_at_risk)
+    decision_context = _decision_context(
+        contract, settings, market_context, breakeven, max_contracts, premium_at_risk, today=today
+    )
 
     result = ScoredContract(
         contract=contract,
@@ -73,11 +139,15 @@ def score_contracts(
     contracts: List[OptionContract],
     settings,
     market_context: Optional[MarketContext] = None,
+    today: Optional[date] = None,
 ) -> Tuple[List[ScoredContract], List[RejectedContract]]:
+    # Resolved once for the whole batch, so a scan that straddles midnight ET cannot
+    # score its first ticker against a different DTE than its last.
+    today = today or exchange_date()
     accepted: List[ScoredContract] = []
     rejected: List[RejectedContract] = []
     for contract in contracts:
-        scored, rejection = score_contract(contract, settings, market_context)
+        scored, rejection = score_contract(contract, settings, market_context, today=today)
         if scored:
             accepted.append(scored)
         elif rejection:
@@ -86,11 +156,17 @@ def score_contracts(
     return accepted, rejected
 
 
-def _validate_contract(contract: OptionContract, settings, market_context: Optional[MarketContext] = None) -> RejectedContract:
+def _validate_contract(
+    contract: OptionContract,
+    settings,
+    market_context: Optional[MarketContext] = None,
+    today: Optional[date] = None,
+) -> Optional[RejectedContract]:
+    today = today or exchange_date()
     reasons = []
     if contract.contract_type not in {"call", "put"}:
         reasons.append("unsupported contract type")
-    dte = days_to_expiration(contract)
+    dte = days_to_expiration(contract, today)
     if dte < settings.min_days_to_expiration or dte > settings.max_days_to_expiration:
         reasons.append("outside DTE range")
     if contract.mid_price is None or contract.mid_price <= 0:
@@ -112,7 +188,7 @@ def _validate_contract(contract: OptionContract, settings, market_context: Optio
     if getattr(settings, "require_trend_alignment", False) and not _trend_aligned(contract, market_context):
         reasons.append("trend not aligned")
     if getattr(settings, "avoid_earnings_before_expiration", False) and market_context and market_context.earnings_date:
-        if date.today() <= market_context.earnings_date <= contract.expiration_date:
+        if today <= market_context.earnings_date <= contract.expiration_date:
             reasons.append("earnings before expiration")
 
     if not reasons:
@@ -149,9 +225,10 @@ def _decision_context(
     breakeven: float,
     max_contracts: int,
     premium_at_risk: float,
+    today: Optional[date] = None,
 ) -> dict:
     underlying_price = _underlying_price(contract, market_context)
-    dte = days_to_expiration(contract)
+    dte = days_to_expiration(contract, today)
     iv = contract.implied_volatility or 0.0
     expected_move_pct = round(iv * math.sqrt(max(dte, 0) / 365.0) * 100, 2) if iv and dte > 0 else None
     breakeven_distance_pct = _breakeven_distance_pct(contract, breakeven, underlying_price)
@@ -159,8 +236,12 @@ def _decision_context(
     if expected_move_pct is not None and breakeven_distance_pct is not None:
         expected_move_ok = breakeven_distance_pct <= expected_move_pct
 
-    favorable_value, favorable_pnl = _scenario_value(contract, underlying_price, max_contracts, premium_at_risk, 0.02)
-    adverse_value, adverse_pnl = _scenario_value(contract, underlying_price, max_contracts, premium_at_risk, -0.02)
+    favorable_value, favorable_pnl = _scenario_value(
+        contract, underlying_price, max_contracts, premium_at_risk, _SCENARIO_MOVE_PCT
+    )
+    adverse_value, adverse_pnl = _scenario_value(
+        contract, underlying_price, max_contracts, premium_at_risk, -_SCENARIO_MOVE_PCT
+    )
     trend_aligned = _trend_aligned(contract, market_context) if market_context else None
 
     return {
@@ -256,11 +337,10 @@ def _trade_signal(
     watch_reasons = []
 
     ignore_missing_spread = getattr(settings, "ignore_missing_spread_for_signal", False)
-    if contract.spread_pct is None and not ignore_missing_spread:
-        watch_reasons.append("bid/ask spread unavailable")
-    elif contract.spread_pct is None and ignore_missing_spread:
-        pass
-    elif contract.spread_pct > min(settings.max_spread_pct, 20.0):
+    if contract.spread_pct is None:
+        if not ignore_missing_spread:
+            watch_reasons.append("bid/ask spread unavailable")
+    elif contract.spread_pct > min(settings.max_spread_pct, _SIGNAL_MAX_SPREAD_PCT):
         watch_reasons.append("bid/ask spread is wide")
 
     if trend_aligned is False:
@@ -278,7 +358,10 @@ def _trade_signal(
 
     if contract.volume is None or contract.open_interest is None:
         watch_reasons.append("liquidity data incomplete")
-    elif contract.volume < max(settings.min_volume, 10) or contract.open_interest < max(settings.min_open_interest, 100):
+    elif (
+        contract.volume < max(settings.min_volume, _SIGNAL_MIN_VOLUME)
+        or contract.open_interest < max(settings.min_open_interest, _SIGNAL_MIN_OPEN_INTEREST)
+    ):
         watch_reasons.append("liquidity is thin")
 
     if contract.mid_price is None or contract.mid_price <= 0:
