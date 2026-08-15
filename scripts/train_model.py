@@ -100,6 +100,13 @@ def main() -> int:
     print(f"\nVERDICT: {gate_summary(report)}")
 
     if report.get("model") is None:
+        # Exit code distinguishes "not yet" from "went wrong". Waiting for trades to
+        # resolve is the expected state for the first few weeks, and a nonzero exit
+        # there would make every scheduled run look like a failure.
+        not_enough = report["n_resolved"] < report["min_trades"]
+        if not_enough:
+            print("Nothing to train on yet. Re-run once more trades have resolved.")
+            return 0
         print("No model was fitted, so nothing was saved.")
         return 1
 
