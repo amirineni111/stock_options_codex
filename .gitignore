@@ -58,6 +58,8 @@ desktop.ini
 
 # ── Streamlit ───────────────────────────────────────────────────────────────
 .streamlit/secrets.toml
+# Port the running dashboard was started on (written by start_options_dashboard.bat)
+.dashboard.port
 
 # ── App preferences (local UI state) ────────────────────────────────────────
 data/app_preferences.json

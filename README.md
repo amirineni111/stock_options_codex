@@ -26,7 +26,8 @@ Copy-Item .env.example .env
 streamlit run app.py
 ```
 
-Or run `start_options_dashboard.bat` and open http://localhost:8501.
+Or run `start_options_dashboard.bat`. It opens the dashboard on port 8501, or on the next
+free port if 8501 is taken, and prints the port it chose. `stop_options_dashboard.bat` stops it.
 
 The intraday lane needs no API key. The options lane needs `POLYGON_API_KEY`; real-time
 options data requires a Polygon plan that includes it.

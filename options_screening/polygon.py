@@ -84,8 +84,13 @@ class PolygonClient:
                 try:
                     response.raise_for_status()
                 except httpx.HTTPStatusError as exc:
+                    # Polygon's own message is the difference between "the key is
+                    # wrong" and "the plan does not include this endpoint", and a bare
+                    # status code cannot tell the two apart.
+                    detail = _error_detail(exc.response, self.api_key)
                     raise RuntimeError(
                         f"Polygon API error {exc.response.status_code} for {safe_url}"
+                        + (f": {detail}" if detail else "")
                     ) from None
                 return response.json()
 
@@ -356,6 +361,18 @@ def _sleep_before_retry(attempt: int, retry_after: Optional[str]) -> None:
             pass
     ceiling = min(BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)), BACKOFF_MAX_SECONDS)
     _time.sleep(random.uniform(0.0, ceiling))
+
+
+def _error_detail(response: Any, api_key: str) -> str:
+    """Polygon's explanation from an error body, key redacted. Empty if there is none."""
+    try:
+        payload = response.json()
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    detail = str(payload.get("message") or payload.get("error") or "")
+    return detail.replace(api_key, "REDACTED")[:300]
 
 
 def _epoch_ms_to_iso(value: Any) -> Optional[str]:

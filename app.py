@@ -717,6 +717,31 @@ def _render_watchlist(storage: Storage, latest: pd.DataFrame) -> None:
             st.rerun()
 
 
+def _latest_scan_failure(logs: pd.DataFrame):
+    """
+    Why the tables are empty, when the most recent scan fetched nothing at all.
+
+    Read from the stored logs rather than the scan's return value so it survives the
+    reruns auto-refresh triggers; a one-off banner is gone before it is read.
+    """
+    if logs.empty or "scan_id" not in logs.columns:
+        return None
+    last_scan = logs[logs["scan_id"] == logs["scan_id"].max()]
+    errors = last_scan["error"].dropna()
+    errors = errors[errors.astype(str).str.strip() != ""]
+    if errors.empty or len(errors) < len(last_scan):
+        return None
+    sample = str(errors.iloc[0])
+    if "Polygon API error 403" in sample or "not entitled" in sample.lower():
+        return (
+            f"The last scan returned no data: Polygon refused all {len(last_scan)} tickers "
+            "with 403 (not entitled). The API key is valid, but its plan does not include "
+            "the option chain snapshot endpoint this page depends on. The tables stay empty "
+            "until the plan includes options snapshots. The Intraday Stocks page is unaffected."
+        )
+    return f"The last scan returned no data: all {len(last_scan)} tickers failed. First error: {sample}"
+
+
 def _format_eastern_time(value) -> str:
     if pd.isna(value):
         return value
@@ -1013,11 +1038,20 @@ def main() -> None:
         st.session_state.last_scan_at = datetime.now(EASTERN_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
         if auto_due:
             st.session_state.last_auto_refresh_count = auto_count
-        st.success(f"Scan complete: {summary.accepted} accepted, {summary.rejected} rejected, {summary.errors} errors.")
+        scan_message = f"Scan complete: {summary.accepted} accepted, {summary.rejected} rejected, {summary.errors} errors."
+        # A scan where every ticker errored is not a success, and a green banner over
+        # empty tables reads as "nothing qualified" rather than "nothing was fetched".
+        if summary.errors and not (summary.accepted or summary.rejected):
+            st.warning(scan_message)
+        else:
+            st.success(scan_message)
 
     latest = storage.load_latest_results()
     rejected = storage.load_latest_rejections()
     logs = storage.load_scan_logs()
+    scan_failure = _latest_scan_failure(logs)
+    if scan_failure:
+        st.error(scan_failure)
     latest = _format_time_columns(latest, ["as_of"])
     rejected = _format_time_columns(rejected, ["as_of"])
     logs = _format_time_columns(logs, ["created_at"])
