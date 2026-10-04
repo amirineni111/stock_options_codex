@@ -43,7 +43,9 @@ HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 INTERVAL_RANGE = {
     "15m": "5d",
     "1h": "1mo",
-    "1d": "6mo",
+    # A year, not six months: the options lane folds these into weekly bars for its
+    # higher-timeframe read, which needs 26 weeks to seed MACD.
+    "1d": "1y",
 }
 
 # Higher timeframes change slowly, so cache them. The intraday frame is deliberately

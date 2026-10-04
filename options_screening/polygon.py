@@ -106,6 +106,8 @@ class PolygonClient:
         expiration_lte: Optional[date] = None,
         page_size: int = MAX_PAGE_SIZE,
         max_contracts: Optional[int] = None,
+        strike_gte: Optional[float] = None,
+        strike_lte: Optional[float] = None,
     ) -> List[OptionContract]:
         """
         Every contract in the expiry window, paginated.
@@ -127,6 +129,10 @@ class PolygonClient:
             params["expiration_date.gte"] = expiration_gte.isoformat()
         if expiration_lte:
             params["expiration_date.lte"] = expiration_lte.isoformat()
+        if strike_gte is not None:
+            params["strike_price.gte"] = strike_gte
+        if strike_lte is not None:
+            params["strike_price.lte"] = strike_lte
 
         items: List[Dict[str, Any]] = []
         path = f"/v3/snapshot/options/{underlying.upper()}"
@@ -181,6 +187,29 @@ class PolygonClient:
             return self._parse_chain_snapshot(underlying, item)
         except (KeyError, TypeError, ValueError):
             return None
+
+    def get_option_bars(
+        self,
+        contract_ticker: str,
+        start: date,
+        end: date,
+        minutes: int = 15,
+    ) -> List[Dict[str, Any]]:
+        """
+        Intraday OHLCV bars for one contract, oldest first, as canonical bar dicts.
+
+        This is what lets an option forward-test be resolved against the contract's
+        own *path* rather than whatever mid a scan happened to observe: a target or
+        stop touched and retraced between two scans is visible in a bar's high/low and
+        invisible in a snapshot. Available on the Options Starter plan, which has no
+        quotes or trades.
+        """
+        payload = self._get(
+            f"/v2/aggs/ticker/{contract_ticker.upper()}/range/{int(minutes)}/minute/"
+            f"{start.isoformat()}/{end.isoformat()}",
+            {"adjusted": "true", "sort": "asc", "limit": 50000},
+        )
+        return _aggs_to_bars(payload)
 
     # ── Equities ─────────────────────────────────────────────────────────────
 
@@ -268,23 +297,7 @@ class PolygonClient:
             f"/v2/aggs/ticker/{ticker.upper()}/range/1/day/{start.isoformat()}/{end.isoformat()}",
             {"adjusted": "true", "sort": "asc", "limit": 5000},
         )
-        bars: List[Dict[str, Any]] = []
-        for item in payload.get("results") or []:
-            close = _first_float(item.get("c"))
-            if close is None:
-                continue
-            timestamp = item.get("t")
-            bars.append(
-                {
-                    "timestamp": _epoch_ms_to_iso(timestamp),
-                    "open": _first_float(item.get("o")),
-                    "high": _first_float(item.get("h")),
-                    "low": _first_float(item.get("l")),
-                    "close": close,
-                    "volume": _first_float(item.get("v")) or 0.0,
-                }
-            )
-        return bars
+        return _aggs_to_bars(payload)
 
     def get_daily_closes(self, ticker: str, start: date, end: date) -> List[float]:
         return [bar["close"] for bar in self.get_daily_bars(ticker, start, end)]
@@ -315,6 +328,9 @@ class PolygonClient:
         last_trade = item.get("last_trade") or {}
         last_quote = item.get("last_quote") or {}
         underlying_asset = item.get("underlying_asset") or {}
+        # Nanoseconds since the epoch: the time of the day bar's last update, which on
+        # a plan without quotes is the time of the price being used.
+        last_updated = _first_float(day.get("last_updated"), last_trade.get("sip_timestamp"))
 
         last_price = _first_float(day.get("close"), day.get("last_price"), last_trade.get("price"))
         bid = _first_float(last_quote.get("bid"), item.get("bid"))
@@ -340,6 +356,7 @@ class PolygonClient:
             theta=_first_float(greeks.get("theta")),
             vega=_first_float(greeks.get("vega")),
             underlying_price=underlying_price,
+            last_trade_at=_epoch_ns_to_datetime(last_updated),
             as_of=utc_now(),
         )
 
@@ -373,6 +390,35 @@ def _error_detail(response: Any, api_key: str) -> str:
         return ""
     detail = str(payload.get("message") or payload.get("error") or "")
     return detail.replace(api_key, "REDACTED")[:300]
+
+
+def _aggs_to_bars(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """An aggregates payload as the canonical bar dicts the indicator layer expects."""
+    bars: List[Dict[str, Any]] = []
+    for item in payload.get("results") or []:
+        close = _first_float(item.get("c"))
+        if close is None:
+            continue
+        bars.append(
+            {
+                "timestamp": _epoch_ms_to_iso(item.get("t")),
+                "open": _first_float(item.get("o")),
+                "high": _first_float(item.get("h")),
+                "low": _first_float(item.get("l")),
+                "close": close,
+                "volume": _first_float(item.get("v")) or 0.0,
+            }
+        )
+    return bars
+
+
+def _epoch_ns_to_datetime(value: Optional[float]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromtimestamp(value / 1e9, tz=timezone.utc)
+    except (OverflowError, ValueError, OSError):
+        return None
 
 
 def _epoch_ms_to_iso(value: Any) -> Optional[str]:

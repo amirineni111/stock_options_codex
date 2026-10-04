@@ -33,6 +33,9 @@ class OptionContract(BaseModel):
     theta: Optional[float] = None
     vega: Optional[float] = None
     underlying_price: Optional[float] = None
+    # When the price was last traded. On a plan with no quotes the "mid" *is* the last
+    # trade, and an illiquid contract's last trade can be days old.
+    last_trade_at: Optional[datetime] = None
     as_of: datetime = Field(default_factory=utc_now)
 
     @property
@@ -113,6 +116,11 @@ class ScoredContract(BaseModel):
     # Populated when a trained model is serving; a veto only, never a promoter.
     model_prob: Optional[float] = None
     required_prob: Optional[float] = None
+    # The second, independent directional label: the multi-factor engine's daily read
+    # of the underlying (see direction.py), gated by the same contract-quality checks.
+    engine_signal: Optional[str] = None
+    engine_reason: Optional[str] = None
+    engine_score: Optional[float] = None
 
     model_config = {"protected_namespaces": ()}
 
@@ -125,6 +133,12 @@ class MarketContext(BaseModel):
     trend_signal: str = "unknown"
     earnings_date: Optional[date] = None
     earnings_warning: Optional[str] = None
+    # The multi-factor engine's daily read of the underlying: LONG / SHORT when it
+    # makes an actionable call, NEUTRAL when it does not, None when unread.
+    engine_direction: Optional[str] = None
+    engine_signal: Optional[str] = None
+    engine_score: Optional[float] = None
+    engine_reason: Optional[str] = None
     # Full daily OHLCV bars, carried alongside the summary statistics so the signal
     # layer can compute ATR/ADX/structure without a second fetch. Not persisted.
     daily_bars: List[Dict[str, Any]] = Field(default_factory=list)

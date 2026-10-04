@@ -51,6 +51,9 @@ SCAN_RESULT_EXTRA_COLUMNS = {
     "decay_at_target": "REAL",
     "model_prob": "REAL",
     "required_prob": "REAL",
+    "engine_signal": "TEXT",
+    "engine_reason": "TEXT",
+    "engine_score": "REAL",
 }
 # The single source of truth for the intraday results table: column name -> SQL type,
 # in insert order. The DDL, the INSERT column list, and the value tuple are all
@@ -117,6 +120,15 @@ INTRADAY_COLUMNS = {
     "as_of": "TEXT",
 }
 
+# Added to signal_tracking after it shipped. An option position is managed on the
+# underlying while its P&L is in premium, so the alert has to say where on the stock
+# the stop and target sit — and by resolution time the scan row holding them is gone.
+TRACKING_EXTRA_COLUMNS = {
+    "underlying_price": "REAL",
+    "underlying_stop": "REAL",
+    "underlying_target": "REAL",
+}
+
 # Columns stored as 0/1 rather than as SQLite booleans.
 _INTRADAY_BOOL_COLUMNS = {"at_key_level", "blocked_ahead"}
 
@@ -142,6 +154,9 @@ _EXTRA_RESULT_FIELDS = (
     "decay_at_target",
     "model_prob",
     "required_prob",
+    "engine_signal",
+    "engine_reason",
+    "engine_score",
 )
 
 
@@ -344,6 +359,41 @@ class Storage:
                     is_shadow INTEGER DEFAULT 0,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
+                -- One row per alert raised: a newly armed signal ('signal') or a
+                -- resolved one ('outcome'), whether or not a push went out. Delivery
+                -- status lives here so a dead webhook is visible in the Alerts tab
+                -- instead of silently losing alerts. UNIQUE is the dedupe: the
+                -- dashboard and the headless runner can both see the same armed
+                -- signal, and only the process that inserts first may push it.
+                CREATE TABLE IF NOT EXISTS alerts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    kind TEXT NOT NULL,
+                    lane TEXT NOT NULL,
+                    tracking_id INTEGER NOT NULL,
+                    ticker TEXT,
+                    contract_ticker TEXT,
+                    signal TEXT,
+                    title TEXT,
+                    body TEXT,
+                    source TEXT,
+                    channel TEXT,
+                    delivered INTEGER DEFAULT 0,
+                    delivery_error TEXT,
+                    UNIQUE(kind, tracking_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts(created_at);
+                -- One implied-volatility reading per underlying per trading day, for
+                -- the IV rank. It cannot live in scan_results: that table keeps only
+                -- the last 10 scans, which on a 15-minute cadence is 2.5 hours, so the
+                -- "rank" compared today's IV with this afternoon's.
+                CREATE TABLE IF NOT EXISTS iv_daily (
+                    underlying TEXT NOT NULL,
+                    day TEXT NOT NULL,
+                    iv REAL NOT NULL,
+                    observations INTEGER NOT NULL DEFAULT 1,
+                    PRIMARY KEY (underlying, day)
+                );
                 CREATE TABLE IF NOT EXISTS intraday_watchlist (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ticker TEXT NOT NULL,
@@ -376,6 +426,7 @@ class Storage:
             # new scoring columns rather than needing a drop.
             self._ensure_columns(conn, "intraday_results", INTRADAY_COLUMNS)
             self._ensure_columns(conn, "intraday_scan_logs", {"provider": "TEXT"})
+            self._ensure_columns(conn, "signal_tracking", TRACKING_EXTRA_COLUMNS)
 
     def start_scan(self, request: Dict) -> int:
         with self._connect() as conn:
@@ -613,25 +664,38 @@ class Storage:
         with self._connect() as conn:
             return pd.read_sql_query("SELECT * FROM intraday_watchlist ORDER BY id DESC", conn)
 
-    def load_iv_history(self, underlying: str, limit: int = 500) -> List[float]:
+    def record_iv(self, underlying: str, day: date, iv: Optional[float]) -> None:
         """
-        Recent implied-volatility observations for one underlying, for the IV rank.
+        Fold one scan's IV reading into the underlying's reading for ``day``.
 
-        Read from the scan history this repo has been accumulating since its first
-        commit — the data was already there, nothing was using it. One observation per
-        scan per underlying (the median across that scan's contracts) rather than every
-        contract, so a chain with 200 strikes does not outvote 200 days of history.
+        A running mean across the day's scans, so a day scanned 26 times and a day
+        scanned once each count as one observation in the rank.
+        """
+        if iv is None or iv <= 0:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO iv_daily (underlying, day, iv, observations) VALUES (?, ?, ?, 1)
+                ON CONFLICT(underlying, day) DO UPDATE SET
+                    iv = (iv * observations + excluded.iv) / (observations + 1),
+                    observations = observations + 1
+                """,
+                (underlying.upper(), day.isoformat(), float(iv)),
+            )
+
+    def load_iv_history(self, underlying: str, limit: int = 252) -> List[float]:
+        """
+        Daily implied-volatility readings for one underlying, newest first — about a
+        year by default, which is the window an IV rank is conventionally quoted over.
+
+        The rank needs 10 days before it reports anything (``greeks.iv_rank``), so a
+        new install shows it blank for its first two weeks rather than ranking against
+        a handful of intraday readings.
         """
         with self._connect() as conn:
             rows = conn.execute(
-                """
-                SELECT AVG(implied_volatility) AS iv
-                FROM scan_results
-                WHERE underlying = ? AND implied_volatility IS NOT NULL
-                GROUP BY scan_id
-                ORDER BY scan_id DESC
-                LIMIT ?
-                """,
+                "SELECT iv FROM iv_daily WHERE underlying = ? ORDER BY day DESC LIMIT ?",
                 (underlying.upper(), limit),
             ).fetchall()
         return [row[0] for row in rows if row[0] is not None]
@@ -665,6 +729,10 @@ class Storage:
         cost_pct: Optional[float] = None,
         cost_ratio: Optional[float] = None,
         total_score: Optional[float] = None,
+        underlying_price: Optional[float] = None,
+        underlying_stop: Optional[float] = None,
+        underlying_target: Optional[float] = None,
+        one_per_underlying: bool = False,
     ) -> Optional[int]:
         """
         Arm an actionable signal for hands-off forward evaluation.
@@ -677,17 +745,29 @@ class Storage:
         scan, so if the vector is not stored now it cannot be reconstructed when the
         trade resolves days later, and the outcome row is unlearnable.
         """
-        # Dedupe key: the specific instrument. Two different AAPL contracts are
-        # genuinely different trades, so the key includes the contract when there is
-        # one and falls back to the ticker for the equity lane.
-        instrument = contract_ticker or ticker
+        # Dedupe key: the specific instrument, falling back to the ticker for the
+        # equity lane. With ``one_per_underlying`` it is the underlying and the signal
+        # instead: five AMD calls armed together are one bet on AMD rising, and
+        # tracking all five would grade one stock move as five predictions — the
+        # scorecard's accuracy would swing on whichever name had the most strikes, and
+        # the model would train on duplicates. Keying on the signal keeps the two
+        # options labels independent, so each can hold its own AMD call.
+        cooldown = f"-{self.REARM_COOLDOWN_MINUTES} minutes"
         with self._connect() as conn:
-            existing = conn.execute(
-                "SELECT 1 FROM signal_tracking "
-                "WHERE lane=? AND COALESCE(contract_ticker, ticker)=? AND direction=? "
-                "AND (status='open' OR created_at >= datetime('now', ?)) LIMIT 1",
-                (lane, instrument, direction, f"-{self.REARM_COOLDOWN_MINUTES} minutes"),
-            ).fetchone()
+            if one_per_underlying:
+                existing = conn.execute(
+                    "SELECT 1 FROM signal_tracking "
+                    "WHERE lane=? AND ticker=? AND signal=? "
+                    "AND (status='open' OR created_at >= datetime('now', ?)) LIMIT 1",
+                    (lane, ticker, signal, cooldown),
+                ).fetchone()
+            else:
+                existing = conn.execute(
+                    "SELECT 1 FROM signal_tracking "
+                    "WHERE lane=? AND COALESCE(contract_ticker, ticker)=? AND direction=? "
+                    "AND (status='open' OR created_at >= datetime('now', ?)) LIMIT 1",
+                    (lane, contract_ticker or ticker, direction, cooldown),
+                ).fetchone()
             if existing:
                 return None
             cursor = conn.execute(
@@ -697,8 +777,8 @@ class Storage:
                     stop_price, target_price, stop_dollars, target_dollars, atr14,
                     entry_ts, expiration_date, features_json, feature_version,
                     model_prob, required_prob, model_mode, cost_pct, cost_ratio,
-                    total_score
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    total_score, underlying_price, underlying_stop, underlying_target
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     lane, ticker, contract_ticker, signal, direction, entry,
@@ -706,7 +786,7 @@ class Storage:
                     entry_ts, expiration_date,
                     json.dumps(features) if features else None, feature_version,
                     model_prob, required_prob, model_mode, cost_pct, cost_ratio,
-                    total_score,
+                    total_score, underlying_price, underlying_stop, underlying_target,
                 ),
             )
             return cursor.lastrowid
@@ -772,8 +852,8 @@ class Storage:
                     break
 
             if outcome is None:
-                created = parse_ts(row.get("created_at"))
-                aged_out = created is not None and (now - created).total_seconds() > max_hold_hours * 3600
+                age = _age_seconds(row, now)
+                aged_out = age is not None and age > max_hold_hours * 3600
                 if aged_out and forward:
                     exit_price = forward[-1].get("close")
                     exit_ts = forward[-1].get("timestamp")
@@ -794,18 +874,23 @@ class Storage:
         today: Optional[date] = None,
         now: Optional[datetime] = None,
         max_hold_days: float = 30.0,
+        bars: Optional[Dict[str, List[Dict]]] = None,
     ) -> int:
         """
-        Resolve open option signals against fresh contract mids.
+        Resolve open option signals against each contract's own price path.
 
-        ``quotes`` maps contract ticker to its current mid. Unlike the equity lane
-        there are no forward *bars* here — only the point-in-time snapshots each scan
-        happens to take — so a level touched and retraced between two scans is missed.
-        That is a real limitation and it cuts both ways: a missed target understates
-        the win rate, a missed stop overstates it. Checking the stop first on every
-        observation keeps the bias conservative, and the alternative (inferring the
-        premium path from the underlying) would replace a measurement gap with a
-        modelling assumption.
+        ``bars`` maps contract ticker to its intraday bars (15-minute, from Polygon
+        aggregates). When a contract has them, every bar after entry is walked in
+        order, stop before target within a bar, exactly as the equity lane does — so a
+        level touched and retraced between two scans is still seen. A bar that *opens*
+        through the stop fills at that open, not at the stop: options gap overnight,
+        and crediting the stop price on a gap would understate the loss. A gap through
+        the target is credited only at the target, for the same reason in reverse.
+
+        ``quotes`` maps contract ticker to its current mid, and is the fallback for a
+        contract whose bars could not be fetched: a point-in-time check that misses
+        anything touched and retraced between scans. Checking the stop first keeps
+        that bias conservative.
 
         Also closes anything at or past expiry, and anything held past
         ``max_hold_days``.
@@ -816,6 +901,7 @@ class Storage:
 
         now = now or utc_now()
         today = today or exchange_date(now)
+        bars = bars or {}
         resolved = 0
 
         for row in open_rows:
@@ -824,8 +910,29 @@ class Storage:
             stop = row.get("stop_price") or 0.0
             target = row.get("target_price") or 0.0
             exit_price = outcome = exit_reason = None
+            exit_ts = now.isoformat()
 
-            if mid is not None:
+            if contract in bars:
+                entered = parse_ts(row.get("entry_ts") or row.get("created_at"))
+                forward = [
+                    b for b in bars[contract]
+                    if entered is not None and (_bar_time(b) or entered) > entered
+                ]
+                for bar in forward:
+                    high, low, bar_open = bar.get("high"), bar.get("low"), bar.get("open")
+                    if high is None or low is None:
+                        continue
+                    if low <= stop:
+                        fill = bar_open if bar_open is not None and bar_open < stop else stop
+                        exit_price, outcome, exit_reason = fill, "LOSS", "STOP"
+                    elif high >= target:
+                        exit_price, outcome, exit_reason = target, "WIN", "TARGET"
+                    if outcome:
+                        exit_ts = bar.get("timestamp") or exit_ts
+                        break
+                if mid is None and forward:
+                    mid = forward[-1].get("close")
+            elif mid is not None:
                 # A long option: premium falling to the stop is the loss, rising to
                 # the target is the win. Direction is already baked into the bracket.
                 if mid <= stop:
@@ -836,8 +943,8 @@ class Storage:
             if outcome is None:
                 expiry = row.get("expiration_date")
                 expiry_date = date.fromisoformat(expiry) if expiry else None
-                created = parse_ts(row.get("created_at"))
-                aged_out = created is not None and (now - created).total_seconds() > max_hold_days * 86400
+                age = _age_seconds(row, now)
+                aged_out = age is not None and age > max_hold_days * 86400
                 # Close a day before expiry: the last session is gamma/decay noise,
                 # not a test of the thesis.
                 expiring = expiry_date is not None and today >= expiry_date - timedelta(days=1)
@@ -847,7 +954,7 @@ class Storage:
                 else:
                     continue
 
-            self._close_tracked(row, "options", exit_price, now.isoformat(), exit_reason, outcome)
+            self._close_tracked(row, "options", exit_price, exit_ts, exit_reason, outcome)
             resolved += 1
 
         if resolved:
@@ -972,6 +1079,143 @@ class Storage:
             params.append(status)
         with self._connect() as conn:
             return pd.read_sql_query(query + " ORDER BY id DESC", conn, params=params)
+
+    def load_predictions(self, lane: str) -> pd.DataFrame:
+        """
+        Every resolved trade beside what was predicted for it at arm time.
+
+        The outcome table alone says what happened; the tracking row says what was
+        *called* — the signal tier, the score, the model's probability, the direction.
+        Joining them is what turns a list of results into a scorecard of the
+        classifier.
+        """
+        with self._connect() as conn:
+            return pd.read_sql_query(
+                """
+                SELECT o.id, o.tracking_id, o.ticker, o.contract_ticker, o.signal,
+                       o.entry_price, o.exit_price, o.net_dollars, o.exit_pct,
+                       o.r_multiple, o.outcome, o.exit_reason, o.hold_minutes,
+                       o.exit_ts, o.created_at AS resolved_at,
+                       t.direction, t.stop_price, t.target_price, t.total_score,
+                       t.model_prob, t.required_prob, t.model_mode, t.entry_ts,
+                       t.expiration_date, t.created_at AS armed_at
+                FROM trade_outcomes o
+                JOIN signal_tracking t ON t.id = o.tracking_id
+                WHERE o.lane = ?
+                ORDER BY o.id ASC
+                """,
+                conn,
+                params=(lane,),
+            )
+
+    # ── Alerts ───────────────────────────────────────────────────────────────
+
+    # How far back a sweep looks for signals or outcomes that never got an alert.
+    # Long enough to survive a skipped 15-minute cycle or a dashboard rerun cutting a
+    # scan off between arming and delivery; short enough that switching alerts on
+    # does not push a day's worth of history to the phone.
+    ALERT_SWEEP_MINUTES = 90
+
+    def load_pending_signal_alerts(self, max_age_minutes: Optional[int] = None) -> List[Dict]:
+        """Recently armed tracking rows that have no 'signal' alert yet."""
+        age = self.ALERT_SWEEP_MINUTES if max_age_minutes is None else max_age_minutes
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT t.* FROM signal_tracking t "
+                "LEFT JOIN alerts a ON a.kind = 'signal' AND a.tracking_id = t.id "
+                "WHERE a.id IS NULL AND t.created_at >= datetime('now', ?) "
+                "ORDER BY t.id",
+                (f"-{int(age)} minutes",),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def load_pending_outcome_alerts(self, max_age_minutes: Optional[int] = None) -> List[Dict]:
+        """Recently resolved trades that have no 'outcome' alert yet, with their call."""
+        age = self.ALERT_SWEEP_MINUTES if max_age_minutes is None else max_age_minutes
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT o.*, t.direction, t.stop_price, t.target_price, t.total_score, "
+                "       t.model_prob, t.entry_ts, t.expiration_date, "
+                "       t.created_at AS armed_at "
+                "FROM trade_outcomes o "
+                "JOIN signal_tracking t ON t.id = o.tracking_id "
+                "LEFT JOIN alerts a ON a.kind = 'outcome' AND a.tracking_id = o.tracking_id "
+                "WHERE a.id IS NULL AND o.created_at >= datetime('now', ?) "
+                "ORDER BY o.id",
+                (f"-{int(age)} minutes",),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def claim_alert(
+        self,
+        kind: str,
+        lane: str,
+        tracking_id: int,
+        title: str,
+        body: str,
+        source: str,
+        channel: Optional[str],
+        ticker: Optional[str] = None,
+        contract_ticker: Optional[str] = None,
+        signal: Optional[str] = None,
+    ) -> bool:
+        """
+        Log one alert before it is pushed. Returns False when it was already claimed
+        — by an earlier sweep, or by the other process racing this one.
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO alerts (kind, lane, tracking_id, ticker, "
+                "contract_ticker, signal, title, body, source, channel) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (kind, lane, tracking_id, ticker, contract_ticker, signal, title, body,
+                 source, channel),
+            )
+            return cursor.rowcount == 1
+
+    def set_alert_delivery(self, kind: str, tracking_id: int, error: Optional[str]) -> None:
+        """Record the push outcome of a claimed alert."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE alerts SET delivered = ?, delivery_error = ? "
+                "WHERE kind = ? AND tracking_id = ?",
+                (int(error is None), error, kind, tracking_id),
+            )
+
+    def load_alerts(
+        self,
+        lane: Optional[str] = None,
+        limit: int = 500,
+        since_minutes: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """
+        Most recent alerts first, each with the current state of the trade it is
+        about: ``trade_status`` ('open' | 'closed') and, once closed, the outcome.
+        """
+        sql = (
+            "SELECT a.*, t.status AS trade_status, t.entry_price, t.stop_price, "
+            "       t.target_price, o.outcome, o.exit_reason, o.exit_price, "
+            "       o.r_multiple, o.exit_ts "
+            "FROM alerts a "
+            "LEFT JOIN signal_tracking t ON t.id = a.tracking_id "
+            "LEFT JOIN trade_outcomes o ON o.id = ("
+            "  SELECT MAX(id) FROM trade_outcomes WHERE tracking_id = a.tracking_id"
+            ") "
+            "WHERE 1 = 1"
+        )
+        params: List = []
+        if lane:
+            sql += " AND a.lane = ?"
+            params.append(lane)
+        if since_minutes is not None:
+            sql += " AND a.created_at >= datetime('now', ?)"
+            params.append(f"-{int(since_minutes)} minutes")
+        sql += " ORDER BY a.created_at DESC, a.id DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            return pd.read_sql_query(sql, conn, params=params)
 
     def load_training_rows(self, lane: str, feature_version: int) -> List[Dict]:
         """
@@ -1098,6 +1342,24 @@ class Storage:
         for column, column_type in columns.items():
             if column not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+
+def _age_seconds(row: Dict, now: datetime) -> Optional[float]:
+    """
+    How long a tracked trade has been open, measured from its entry bar.
+
+    Not from ``created_at``: that is SQLite's wall clock, and subtracting it from an
+    injected ``now`` mixes two clocks — the timeout test passed the week it was
+    written and failed every week after.
+    """
+    started = parse_ts(row.get("entry_ts") or row.get("created_at"))
+    if started is None:
+        return None
+    return (now - started).total_seconds()
+
+
+def _bar_time(bar: Dict) -> Optional[datetime]:
+    return parse_ts(bar.get("timestamp"))
 
 
 def _intraday_value(result: IntradayResult, column: str):

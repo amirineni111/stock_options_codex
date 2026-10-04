@@ -51,6 +51,16 @@ _SIGNAL_MAX_SPREAD_PCT = 20.0
 _SIGNAL_MIN_VOLUME = 10
 _SIGNAL_MIN_OPEN_INTEREST = 100
 
+# On a plan with no bid/ask the entry is the last trade, so a contract that has not
+# traded for an hour is priced at a number that may no longer exist. Its outcome would
+# measure the stale print, not the call.
+_MAX_PRICE_AGE_MINUTES = 60.0
+
+# The second label's names, kept apart from the moving-average rule's so the scorecard
+# can grade the two directional reads against each other.
+ENGINE_CALL = "ENGINE_BUY_CALL"
+ENGINE_PUT = "ENGINE_BUY_PUT"
+
 # The +/- move used for the scenario P&L columns.
 _SCENARIO_MOVE_PCT = 0.02
 
@@ -224,7 +234,14 @@ def _validate_contract(
         reasons.append("IV outside range")
     if contract.mid_price and contract.mid_price * 100 > settings.fixed_risk:
         reasons.append("one contract premium exceeds fixed risk")
-    if getattr(settings, "require_trend_alignment", False) and not _trend_aligned(contract, market_context):
+    # Either directional read can satisfy the filter. If only the moving-average stack
+    # could, every contract the engine calls would be rejected before it was labelled,
+    # and the comparison between the two reads would only ever see their overlap.
+    if (
+        getattr(settings, "require_trend_alignment", False)
+        and not _trend_aligned(contract, market_context)
+        and not _engine_aligned(contract, market_context)
+    ):
         reasons.append("trend not aligned")
     if getattr(settings, "avoid_earnings_before_expiration", False) and market_context and market_context.earnings_date:
         if today <= market_context.earnings_date <= contract.expiration_date:
@@ -255,6 +272,22 @@ def _trend_aligned(contract: OptionContract, market_context: Optional[MarketCont
     if contract.contract_type == "put":
         return market_context.trend_signal == "bearish"
     return False
+
+
+def _engine_aligned(contract: OptionContract, market_context: Optional[MarketContext]) -> bool:
+    if not market_context or not market_context.engine_direction:
+        return False
+    wanted = "LONG" if contract.contract_type == "call" else "SHORT"
+    return market_context.engine_direction == wanted
+
+
+def price_age_minutes(contract: OptionContract) -> Optional[float]:
+    """Minutes since an *unquoted* contract last traded; None when quoted or unknown."""
+    if contract.bid is not None and contract.ask is not None:
+        return None
+    if contract.last_trade_at is None:
+        return None
+    return max(0.0, (contract.as_of - contract.last_trade_at).total_seconds() / 60.0)
 
 
 def _decision_context(
@@ -456,6 +489,9 @@ def _trade_signal(
     levels = levels or {}
     avoid_reasons = []
     watch_reasons = []
+    # Objections that are about direction rather than about the contract. The second
+    # label ignores these: it has its own directional read.
+    trend_reasons = []
     # Tracked separately from the reason strings so the income-structure suggestion
     # can tell "the only problem is direction" from "nobody is quoting this".
     liquidity_ok = True
@@ -469,10 +505,15 @@ def _trade_signal(
         liquidity_ok = False
         watch_reasons.append("bid/ask spread is wide")
 
+    age = price_age_minutes(contract)
+    if age is not None and age > _MAX_PRICE_AGE_MINUTES:
+        watch_reasons.append(f"last trade {_age_text(age)} ago - price may be stale")
+
     if trend_aligned is False:
-        watch_reasons.append("trend is not aligned")
+        trend_reasons.append("trend is not aligned")
     elif trend_aligned is None:
-        watch_reasons.append("trend is unknown")
+        trend_reasons.append("trend is unknown")
+    watch_reasons.extend(trend_reasons)
 
     if expected_move_ok is False:
         watch_reasons.append("breakeven is beyond rough expected move")
@@ -507,20 +548,59 @@ def _trade_signal(
     if contract.mid_price and contract.mid_price * 100 > settings.fixed_risk:
         avoid_reasons.append("one contract exceeds fixed risk")
 
+    quality_reasons = [r for r in watch_reasons if r not in trend_reasons]
+    engine = _engine_signal(contract, market_context, avoid_reasons, quality_reasons)
+
     if avoid_reasons:
-        return {"trade_signal": "AVOID", "signal_reason": "; ".join(avoid_reasons)}
+        return {"trade_signal": "AVOID", "signal_reason": "; ".join(avoid_reasons), **engine}
 
     if watch_reasons:
         signal = "WATCH_ONLY"
         if _income_structure_applies(trend_aligned, liquidity_ok, watch_reasons):
             signal = _income_signal(contract)
-        return {"trade_signal": signal, "signal_reason": "; ".join(watch_reasons)}
+        return {"trade_signal": signal, "signal_reason": "; ".join(watch_reasons), **engine}
 
     if contract.contract_type == "call":
-        return {"trade_signal": "BUY_CALL_CANDIDATE", "signal_reason": "trend, liquidity, spread, and expected move checks passed"}
+        return {"trade_signal": "BUY_CALL_CANDIDATE", "signal_reason": "trend, liquidity, spread, and expected move checks passed", **engine}
     if contract.contract_type == "put":
-        return {"trade_signal": "BUY_PUT_CANDIDATE", "signal_reason": "trend, liquidity, spread, and expected move checks passed"}
-    return {"trade_signal": "AVOID", "signal_reason": "unsupported contract type"}
+        return {"trade_signal": "BUY_PUT_CANDIDATE", "signal_reason": "trend, liquidity, spread, and expected move checks passed", **engine}
+    return {"trade_signal": "AVOID", "signal_reason": "unsupported contract type", **engine}
+
+
+def _engine_signal(
+    contract: OptionContract,
+    market_context: Optional[MarketContext],
+    avoid_reasons: List[str],
+    quality_reasons: List[str],
+) -> dict:
+    """
+    The second label: the engine's daily read decides direction, and the contract
+    must pass every contract-quality check the first label applies. Only the
+    direction source differs, so a difference in outcome is about direction.
+    """
+    if not market_context or market_context.engine_direction is None:
+        return {"engine_signal": None, "engine_reason": "no daily engine read", "engine_score": None}
+    score = market_context.engine_score
+    read = f"engine {market_context.engine_signal} ({score:.0f}pts)" if score is not None else "engine"
+    wanted = "LONG" if contract.contract_type == "call" else "SHORT"
+    if avoid_reasons:
+        signal, reason = "AVOID", "; ".join(avoid_reasons)
+    elif market_context.engine_direction != wanted:
+        signal, reason = "WATCH_ONLY", f"{read} does not call {wanted}"
+    elif quality_reasons:
+        signal, reason = "WATCH_ONLY", "; ".join(quality_reasons)
+    else:
+        signal = ENGINE_CALL if wanted == "LONG" else ENGINE_PUT
+        reason = f"{read}: {market_context.engine_reason}"
+    return {"engine_signal": signal, "engine_reason": reason, "engine_score": score}
+
+
+def _age_text(minutes: float) -> str:
+    if minutes >= 1440:
+        return f"{minutes / 1440:.1f} days"
+    if minutes >= 90:
+        return f"{minutes / 60:.1f} h"
+    return f"{minutes:.0f} min"
 
 
 def _decay_share_of_premium(contract: OptionContract, levels: dict) -> Optional[float]:

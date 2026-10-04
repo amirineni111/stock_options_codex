@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
+from options_screening.alerts import channel_name, deliver_pending, send_test
 from options_screening.config import get_settings
 from options_screening.intraday import IntradayScanRequest, run_intraday_scan
 from options_screening.market_hours import (
@@ -17,7 +18,11 @@ from options_screening.market_hours import (
 from options_screening.refresh import format_refresh_interval, refresh_interval_to_ms
 from options_screening.scanner import ScanRequest, run_scan
 from options_screening.storage import Storage
-from options_screening.ui_panels import render_model_tab, render_performance_tab
+from options_screening.ui_panels import (
+    render_alerts_tab,
+    render_model_tab,
+    render_performance_tab,
+)
 from options_screening.universe import load_sp100_tickers, load_sp500_tickers
 
 
@@ -64,6 +69,8 @@ DEFAULT_PREFERENCES = {
     "intraday_use_relative_strength": True,
     "intraday_auto_refresh_enabled": False,
     "intraday_refresh_interval": 15,
+    "alerts_enabled": True,
+    "alert_webhook": "",
 }
 RESULT_COLUMN_GUIDE = [
     ("rank", "Position after sorting by total score. 1 is the highest-ranked contract in the latest scan.", "1"),
@@ -85,6 +92,9 @@ RESULT_COLUMN_GUIDE = [
     ("breakeven", "Expiration breakeven. Calls: strike + premium. Puts: strike - premium.", "160.45"),
     ("trade_signal", "Rule-based decision label. It is a candidate/watch/avoid signal, not a guaranteed trade.", "BUY_CALL_CANDIDATE"),
     ("signal_reason", "Plain-English reason for the signal, including warnings that downgraded the setup.", "bid/ask spread unavailable"),
+    ("engine_signal", "Second, independent label: direction from the multi-factor engine run on the underlying's daily bars (momentum, mean reversion, breakout, weekly trend, support/resistance) instead of the moving-average rule. Same contract checks. Both are forward-tested; the Performance tab's 'Direction source' breakdown shows which is right more often.", "ENGINE_BUY_CALL"),
+    ("engine_score", "The engine's score for the underlying. 45+ is actionable, 70+ strong.", "58.0"),
+    ("engine_reason", "Why the engine label landed where it did.", "engine BUY_CANDIDATE (58pts): Long candidate"),
     ("underlying_last_price", "Latest underlying stock price used for trend and scenario checks.", "154.20"),
     ("sma20", "20-day simple moving average of the underlying stock.", "151.80"),
     ("sma50", "50-day simple moving average of the underlying stock.", "148.40"),
@@ -170,6 +180,66 @@ def _init_state(preferences: dict) -> None:
         st.session_state.intraday_auto_refresh = bool(preferences["intraday_auto_refresh_enabled"])
     if "intraday_last_auto_refresh_count" not in st.session_state:
         st.session_state.intraday_last_auto_refresh_count = None
+    if "alerts_enabled" not in st.session_state:
+        st.session_state.alerts_enabled = bool(preferences["alerts_enabled"])
+    if "alert_webhook" not in st.session_state:
+        st.session_state.alert_webhook = str(preferences["alert_webhook"] or "")
+
+
+def _alert_url(settings) -> str:
+    """This session's push URL: the sidebar override, else OPTIONS_ALERT_WEBHOOK_URL."""
+    return (st.session_state.get("alert_webhook") or "").strip() or settings.alert_webhook_url
+
+
+def _render_alert_settings(settings) -> None:
+    with st.expander("Phone alerts", expanded=False):
+        st.session_state.alerts_enabled = st.checkbox(
+            "Alert on new signals and outcomes",
+            value=st.session_state.alerts_enabled,
+            help=(
+                "When this dashboard's scan arms a signal or resolves one, push it. Off "
+                "leaves alerting to the headless runner (start_options_alerts.bat), "
+                "which alerts even with no browser open."
+            ),
+        )
+        st.session_state.alert_webhook = st.text_input(
+            "Push URL",
+            value=st.session_state.alert_webhook,
+            placeholder="https://ntfy.sh/your-private-topic",
+            help=(
+                "An ntfy topic URL (install the ntfy app on your iPhone and subscribe to "
+                "the same topic), or a Discord/Slack webhook. Blank uses "
+                "OPTIONS_ALERT_WEBHOOK_URL from .env."
+            ),
+        )
+        url = _alert_url(settings)
+        st.caption(f"Pushing to {channel_name(url)}." if url else "No push URL - alerts are logged to the Alerts tab only.")
+        if st.button("Send test alert", disabled=not url):
+            error = send_test(url)
+            if error:
+                st.error(f"Push failed: {error}")
+            else:
+                st.success("Sent - check your phone.")
+    try:
+        _save_app_preferences(
+            {
+                "alerts_enabled": bool(st.session_state.alerts_enabled),
+                "alert_webhook": st.session_state.alert_webhook,
+            }
+        )
+    except OSError as exc:
+        st.warning(f"Could not save alert settings: {exc}")
+
+
+def _deliver_alerts(storage: Storage, settings) -> None:
+    """Push whatever the scan just armed or resolved: a toast here, a push if configured."""
+    if not st.session_state.get("alerts_enabled", True):
+        return  # leave them unclaimed, so the headless runner can push them
+    report = deliver_pending(storage, _alert_url(settings), "dashboard")
+    for message in report.sent:
+        st.toast(message.title, icon="🔔")
+    if report.errors:
+        st.warning("Alert push failed: " + "; ".join(report.errors))
 
 
 def _render_metric_row(df: pd.DataFrame) -> None:
@@ -203,6 +273,9 @@ def _format_results(df: pd.DataFrame) -> pd.DataFrame:
         "breakeven",
         "trade_signal",
         "signal_reason",
+        "engine_signal",
+        "engine_score",
+        "engine_reason",
         # The premium bracket and the greeks-derived columns, next to the decision
         # they inform rather than at the far right of a 50-column table.
         "premium_entry",
@@ -600,6 +673,7 @@ def _render_intraday_page(settings, storage: Storage, preferences: dict) -> None
             # are resolved against the fresh bars and new signals are armed.
             results, summary, logs = run_intraday_scan(settings, request, storage=storage)
             storage.save_intraday_scan(results, logs)
+        _deliver_alerts(storage, settings)
         st.session_state.intraday_last_scan_at = datetime.now(EASTERN_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
         if auto_due:
             st.session_state.intraday_last_auto_refresh_count = auto_count
@@ -613,12 +687,15 @@ def _render_intraday_page(settings, storage: Storage, preferences: dict) -> None
 
     (
         tab_results,
+        tab_alerts,
         tab_performance,
         tab_model,
         tab_logs,
         tab_watchlist,
         tab_settings,
-    ) = st.tabs(["Results", "Performance", "Model", "Scan Logs", "Watchlist", "Settings"])
+    ) = st.tabs(["Results", "Alerts", "Performance", "Model", "Scan Logs", "Watchlist", "Settings"])
+    with tab_alerts:
+        render_alerts_tab(storage, "intraday")
     with tab_performance:
         render_performance_tab(storage, "intraday")
     with tab_model:
@@ -827,6 +904,7 @@ def main() -> None:
 
     with st.sidebar:
         page = st.radio("Page", ["Options Scanner", "Intraday Stocks"], horizontal=True)
+        _render_alert_settings(settings)
     if page == "Intraday Stocks":
         _render_intraday_page(settings, storage, preferences)
         return
@@ -961,6 +1039,7 @@ def main() -> None:
         tab_calls,
         tab_puts,
         tab_detail,
+        tab_alerts,
         tab_performance,
         tab_model,
         tab_rejected,
@@ -972,6 +1051,7 @@ def main() -> None:
             "Ranked Calls",
             "Ranked Puts",
             "Ticker Detail",
+            "Alerts",
             "Performance",
             "Model",
             "Rejected",
@@ -1035,10 +1115,15 @@ def main() -> None:
     if run_now or auto_due:
         with st.spinner("Scanning Polygon option chains..."):
             summary = run_scan(settings, storage, scan_request)
+        _deliver_alerts(storage, settings)
         st.session_state.last_scan_at = datetime.now(EASTERN_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
         if auto_due:
             st.session_state.last_auto_refresh_count = auto_count
-        scan_message = f"Scan complete: {summary.accepted} accepted, {summary.rejected} rejected, {summary.errors} errors."
+        scan_message = (
+            f"Scan complete: {summary.accepted} accepted, {summary.rejected} rejected, "
+            f"{summary.errors} errors; {summary.armed} new signals tracked, "
+            f"{summary.resolved} resolved."
+        )
         # A scan where every ticker errored is not a success, and a green banner over
         # empty tables reads as "nothing qualified" rather than "nothing was fetched".
         if summary.errors and not (summary.accepted or summary.rejected):
@@ -1082,6 +1167,9 @@ def main() -> None:
         ticker = st.selectbox("Ticker", detail_tickers)
         detail = latest[latest["underlying"] == ticker].copy() if not latest.empty else latest
         _render_results_table(detail)
+
+    with tab_alerts:
+        render_alerts_tab(storage, "options")
 
     with tab_rejected:
         rejected_underlyings = _render_underlying_filter(rejected, "rejected_underlying_filter")

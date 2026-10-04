@@ -1,5 +1,5 @@
 """
-The Performance and Model panels, shared by both lanes.
+The Performance, Alerts and Model panels, shared by both lanes.
 
 Written once and parameterised by lane rather than duplicated per page. The rest of
 ``app.py`` grew two near-identical copies of every block (one plain, one
@@ -19,6 +19,7 @@ from typing import Any, Dict, Optional
 import pandas as pd
 import streamlit as st
 
+from . import scorecard
 from .training import (
     MIN_RESOLVED_TRADES,
     evaluate_and_fit,
@@ -85,6 +86,8 @@ def render_performance_tab(storage, lane: str) -> None:
             f"across {len(outcomes)} resolved trades."
         )
 
+    _render_scorecard(storage, lane, len(open_rows))
+
     equity = outcomes.sort_values("id")["r_multiple"].fillna(0).cumsum()
     if not equity.empty:
         st.line_chart(equity.reset_index(drop=True), height=220)
@@ -124,6 +127,55 @@ def render_performance_tab(storage, lane: str) -> None:
         )
 
 
+def _render_scorecard(storage, lane: str, open_count: int) -> None:
+    """What each signal called, against what then happened."""
+    predictions = scorecard.annotate(storage.load_predictions(lane))
+    if predictions.empty:
+        return
+    summary = scorecard.summarize(predictions)
+
+    st.markdown("**Prediction scorecard** — what was called vs what happened")
+    st.caption(
+        "Every armed signal predicts *target before stop*. **SUCCESS** = the target was "
+        "hit first, **FAILED** = the stop was hit first, **EXPIRED** = neither within the "
+        "holding window. Accuracy is success / (success + failed): a trade that never "
+        "reached either level is not evidence either way. That is a different question "
+        "from the net win rate above, which counts a profitable timeout as a win."
+    )
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Success", summary["success"])
+    col2.metric("Failed", summary["failed"])
+    col3.metric("Expired", summary["expired"])
+    col4.metric(
+        "Accuracy",
+        f"{summary['accuracy']:.1%}" if summary["accuracy"] is not None else "-",
+        help="Of the predictions the market decided, the share that were right.",
+    )
+    col5.metric("Still open", open_count)
+
+    label = st.selectbox(
+        "Break down by", list(scorecard.BREAKDOWNS), key=f"scorecard_by_{lane}",
+        help=(
+            "Score band and Model P(win) answer the question that matters most: does a "
+            "more confident call actually succeed more often? If accuracy does not rise "
+            "with the score, the score is not measuring edge."
+        ),
+    )
+    table = scorecard.breakdown(predictions, scorecard.BREAKDOWNS[label])
+    st.dataframe(table, use_container_width=True, hide_index=True)
+
+    with st.expander("Every prediction and its result"):
+        columns = [
+            c for c in (
+                "armed_at", "ticker", "contract_ticker", "signal", "side", "total_score",
+                "model_prob", "entry_price", "stop_price", "target_price", "verdict",
+                "exit_reason", "exit_price", "r_multiple", "hold_minutes", "resolved_at",
+            )
+            if c in predictions.columns
+        ]
+        st.dataframe(predictions[columns].iloc[::-1], use_container_width=True, hide_index=True)
+
+
 def _render_open_positions(open_rows: pd.DataFrame) -> None:
     if open_rows.empty:
         return
@@ -137,6 +189,91 @@ def _render_open_positions(open_rows: pd.DataFrame) -> None:
             if c in open_rows.columns
         ]
         st.dataframe(open_rows[columns], use_container_width=True, hide_index=True)
+
+
+# ── Alerts ───────────────────────────────────────────────────────────────────
+
+_ALERT_WINDOWS = {"Last 24 hours": 1440, "Last 7 days": 10080, "Last 30 days": 43200, "All": None}
+
+
+def render_alerts_tab(storage, lane: str) -> None:
+    """Every alert raised for this lane, its push outcome, and how the call turned out."""
+    st.subheader("Alerts")
+    st.caption(
+        "One alert when a signal is armed and one when it resolves, raised by the "
+        "dashboard or by the headless runner (start_options_alerts.bat), whichever saw "
+        "it first. Each is logged here whether or not a push went out, so a dead webhook "
+        "shows up as failures rather than as silence."
+    )
+    window = st.selectbox("Window", list(_ALERT_WINDOWS), index=1, key=f"alerts_window_{lane}")
+    alerts = storage.load_alerts(lane=lane, since_minutes=_ALERT_WINDOWS[window])
+    if alerts.empty:
+        st.info(
+            "No alerts in this window. They appear the first time a scan arms a signal "
+            "or resolves one."
+        )
+        return
+
+    failed = alerts[alerts["delivery_error"].notna()]
+    signals = alerts[alerts["kind"] == "signal"]
+    decided = signals[signals["exit_reason"].isin(["TARGET", "STOP"])]
+    hits = int((decided["exit_reason"] == "TARGET").sum())
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Signals alerted", len(signals))
+    col2.metric("Outcomes alerted", int((alerts["kind"] == "outcome").sum()))
+    col3.metric(
+        "Alerted calls right",
+        f"{hits}/{len(decided)}" if len(decided) else "-",
+        help="Of the alerted signals that have hit their target or stop, how many hit the target first.",
+    )
+    col4.metric("Push failures", len(failed))
+    if not failed.empty:
+        st.warning(
+            f"{len(failed)} alert(s) failed to push. Last error: {failed.iloc[0]['delivery_error']}"
+        )
+
+    records = alerts.to_dict("records")
+    view = pd.DataFrame({
+        "time": alerts["created_at"].apply(_eastern),
+        "kind": alerts["kind"],
+        "alert": alerts["title"],
+        "status": [_alert_status(row) for row in records],
+        "r_multiple": alerts["r_multiple"],
+        "pushed": [_pushed(row) for row in records],
+        "detail": alerts["body"],
+    })
+    st.dataframe(
+        view,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "status": st.column_config.Column(
+                help="OPEN until the trade resolves; then SUCCESS (target first), FAILED (stop first) or EXPIRED."
+            ),
+            "r_multiple": st.column_config.NumberColumn("R", format="%+.2f"),
+        },
+    )
+
+
+def _alert_status(row: Dict[str, Any]) -> str:
+    if row.get("trade_status") == "open" or not row.get("exit_reason"):
+        return "OPEN"
+    return scorecard.verdict(row.get("exit_reason"))
+
+
+def _pushed(row: Dict[str, Any]) -> str:
+    if row.get("delivery_error"):
+        return "failed"
+    if row.get("delivered"):
+        return f"yes ({row.get('channel')})"
+    return "no URL" if not row.get("channel") else "pending"
+
+
+def _eastern(value) -> str:
+    stamp = pd.to_datetime(value, errors="coerce", utc=True)
+    if pd.isna(stamp):
+        return str(value)
+    return stamp.tz_convert("America/New_York").strftime("%m/%d %H:%M ET")
 
 
 # ── Model ────────────────────────────────────────────────────────────────────

@@ -10,6 +10,9 @@ class AppSettings(BaseModel):
     polygon_api_key: Optional[str] = None
     db_path: Path = Path("data/options_screening.sqlite3")
     request_timeout_seconds: float = 20.0
+    # Push endpoint for alerts (an ntfy topic URL, a Discord/Slack webhook, or any URL
+    # accepting a POST). Empty = alerts are logged to the Alerts tab only.
+    alert_webhook_url: str = ""
 
 
 def _default_db_path() -> Path:
@@ -29,4 +32,5 @@ def get_settings() -> AppSettings:
     return AppSettings(
         polygon_api_key=os.getenv("POLYGON_API_KEY"),
         db_path=_resolve_db_path(os.getenv("OPTIONS_DB_PATH")),
+        alert_webhook_url=(os.getenv("OPTIONS_ALERT_WEBHOOK_URL") or "").strip(),
     )

@@ -11,8 +11,9 @@ A local, Python-first screener with two lanes that share one engine:
 
 Every actionable signal in both lanes is automatically forward-tested against its stop
 and target, so the Performance tab reports **measured** win rates and expectancy rather
-than a backtest. This is a decision-support tool: it does not place trades and does not
-connect to a broker.
+than a backtest, and grades every call as SUCCESS or FAILED. New signals and their
+outcomes can be pushed to your phone. This is a decision-support tool: it does not place
+trades and does not connect to a broker.
 
 > Not financial advice. Signals are heuristics for screening, not trade recommendations.
 
@@ -29,20 +30,108 @@ streamlit run app.py
 Or run `start_options_dashboard.bat`. It opens the dashboard on port 8501, or on the next
 free port if 8501 is taken, and prints the port it chose. `stop_options_dashboard.bat` stops it.
 
-The intraday lane needs no API key. The options lane needs `POLYGON_API_KEY`; real-time
-options data requires a Polygon plan that includes it.
+The intraday lane needs no API key. The options lane needs `POLYGON_API_KEY` (Polygon is
+now [Massive](https://massive.com); the same key works). The **Options Starter** plan is
+enough, with two things to know about it:
+
+- It is **15-minute delayed** and has **no bid/ask quotes**. Tick *Allow missing bid-ask
+  spread* (and *Ignore missing bid-ask for trade signal*) in the sidebar, or every
+  contract is rejected. Forward tests are then charged an *estimated* spread from
+  open-interest tiers rather than zero (`tracked_cost_pct` in `scanner.py`).
+- It has no stock data beyond a 5-calls/minute free tier, so the underlying's price,
+  trend and ATR come from Yahoo (the data yfinance wraps), in one batched request per
+  scan. The earnings check needs the separate Benzinga entitlement and says so when it
+  is missing.
 
 ## Configuration
 
 Optional overrides go in `.env` (see `.env.example`):
 
 - `POLYGON_API_KEY` — required for the options lane only.
+- `OPTIONS_ALERT_WEBHOOK_URL` — where to push alerts (see below). Blank = log only.
 - `OPTIONS_DB_PATH` — SQLite location. Defaults to
   `%LOCALAPPDATA%\StockOptionsCodex\options_screening.sqlite3`, deliberately outside
   synced folders: OneDrive and SQLite WAL files produce lock and sync conflicts.
 
 The key is read from the environment only. It is never written to disk by the app, and
 it is redacted from every URL and exception message (`options_screening/polygon.py`).
+
+## Phone alerts
+
+Two moments trigger a push:
+
+- **A new signal** — when a scan arms a setup for forward testing. Several contracts on
+  one underlying in the same scan are one notification, best-scored first, with the
+  premium bracket *and* the underlying's price levels (the position is managed on the
+  stock even though its P&L is in premium).
+- **Its outcome** — when it resolves: **SUCCESS** (target first), **FAILED** (stop
+  first) or **EXPIRED** (neither in time), with R and the lane's running record.
+
+Setup for iPhone, with no account:
+
+1. Install **ntfy** from the App Store and subscribe to a long, unguessable topic name
+   (anyone who knows the name can read it).
+2. Put `OPTIONS_ALERT_WEBHOOK_URL=https://ntfy.sh/<that-topic>` in `.env`, or paste it
+   into *Phone alerts* in the dashboard sidebar.
+3. Press *Send test alert*, or run `python scripts/run_alerts.py --test-push`.
+
+The dashboard only alerts while a tab is open and its timer fires. For alerts with no
+browser open, run **`start_options_alerts.bat`** — a headless runner that scans every
+15 minutes (the cadence the delayed data moves at) with the dashboard's saved settings:
+
+```
+python scripts/run_alerts.py                           # options lane, 09:45-16:20 ET weekdays
+python scripts/run_alerts.py --lanes options intraday  # both pages
+python scripts/run_alerts.py --once                    # one cycle now, then exit
+python scripts/run_alerts.py --sample-alert            # a made-up signal + outcome, real format
+```
+
+The runner and the dashboard can run together: arming is deduplicated and each alert is
+claimed in the `alerts` table before it is pushed, so nothing is pushed twice. Every
+alert is logged in the **Alerts** tab with its push result and the current state of the
+trade, so a dead webhook shows up as failures rather than silence.
+
+## The prediction scorecard
+
+Every armed signal predicts *target before stop*, so it can be graded without
+interpretation. The Performance tab shows success, failed and expired counts and
+**accuracy = success / (success + failed)** — a trade that never reached either level is
+not evidence either way. That deliberately differs from the net win rate, which counts a
+timeout that drifted into profit as a win: a system can call direction well and still
+lose money, or the reverse.
+
+*Break down by* splits the scorecard by predicted signal, side (call/put, long/short),
+score band, model probability, ticker, week and exit reason. **Score band** is the one
+to watch: if accuracy does not rise with the score, the score is not measuring edge.
+
+## Two directional reads, graded against each other
+
+An option is a bet on direction plus a contract. The contract `score` (liquidity,
+spread, delta, DTE, IV) measures only the contract; the **direction** comes from one of
+two independent reads, and every contract carries both labels:
+
+| Label | Direction from | Signals |
+|---|---|---|
+| `trade_signal` | The moving-average stack: price > SMA20 > SMA50 for calls, the reverse for puts | `BUY_CALL_CANDIDATE` / `BUY_PUT_CANDIDATE` |
+| `engine_signal` | The intraday lane's multi-factor engine run on the underlying's **daily** bars: regime-weighted momentum and mean reversion, a 20-session breakout, weekly-trend and SMA confluence, daily support/resistance (`direction.py`) | `ENGINE_BUY_CALL` / `ENGINE_BUY_PUT` |
+
+Both apply the same contract checks, so a difference in outcome is about direction.
+Both are forward-tested and alerted (engine alerts are marked `[engine]`), and the
+scorecard's **Direction source** breakdown says which is right more often. Neither
+replaces the other until one has a measured record. Engine rows are graded but kept out
+of model training until then.
+
+Three things keep the grading honest:
+
+- **One tracked bet per underlying and label.** Five AMD calls armed together are one
+  bet on AMD; tracking all five would grade one stock move as five predictions. The
+  best-scored contract is tracked; the rest still show in the ranked tables.
+- **No trading on stale prints.** Without quotes, the entry is the last trade. A
+  contract that has not traded in the last 60 minutes is WATCH_ONLY ("last trade ... ago
+  - price may be stale"). Off-hours scans therefore track nothing, by design.
+- **IV rank over a real history.** One IV reading per underlying per session, in its own
+  table, ranked over the last year. It used to be read from the scan-results table,
+  which keeps only 10 scans — about 2.5 hours at a 15-minute cadence.
 
 ## The learning loop
 
@@ -52,11 +141,13 @@ the model can only veto, never promote something the rules rejected.
 1. **Log.** Every actionable signal is armed for forward-testing *with its feature
    vector attached*. Without this the outcome rows are unlearnable — the snapshot
    tables are replaced each scan, so by the time a trade resolves its inputs are gone.
-2. **Resolve.** Later scans check open signals against fresh data. A stop or target
-   touch records a WIN/LOSS **net of estimated cost**, linked back to the tracking row.
-   Within a single bar the stop is checked first, because there is no way to know which
-   was touched and assuming the target would inflate the win rate exactly on the most
-   volatile bars.
+2. **Resolve.** Later scans check open signals against fresh data — stocks against
+   their 15-minute bars, options against **the contract's own 15-minute bars** since
+   entry. A stop or target touch records a WIN/LOSS **net of estimated cost**, linked
+   back to the tracking row. Within a single bar the stop is checked first, because
+   there is no way to know which was touched and assuming the target would inflate the
+   win rate exactly on the most volatile bars. An option that gaps through its stop is
+   filled at the open, not at the stop.
 3. **Train.** Once ~120 resolved trades accumulate, the Model tab (or
    `scripts/train_model.py`) walk-forward evaluates an L2 logistic regression and
    reports out-of-sample AUC, Brier, calibration, and expectancy at each threshold.
@@ -140,14 +231,19 @@ options_screening/
   model.py                Logistic model, walk-forward evaluation, calibration metrics
   training.py             Retrain pipeline + quality gate, shared by the CLI and the UI
   storage.py              SQLite persistence, forward-test resolution, model store
-  ui_panels.py            Performance and Model tabs, shared by both lanes
+  ui_panels.py            Alerts, Performance and Model tabs, shared by both lanes
+  alerts.py               Push alerts (ntfy / Discord / Slack / webhook) for signals and outcomes
+  scorecard.py            SUCCESS / FAILED / EXPIRED grading and its breakdowns
+  direction.py            The daily multi-factor read behind the second options label
+  runner.py               The headless runner's schedule and settings mapping
   market_hours.py         US equity market phases (America/New_York)
   timeutil.py             One timestamp parser + the intraday session clock
   models.py, config.py, universe.py, refresh.py
 scripts/
   train_model.py          Retrain from the CLI, with the same gate as the dashboard
   model_report.py         Judge a shadow/active model on live resolved trades
-tests/                    pytest suite (240 tests, all offline)
+  run_alerts.py           Headless 15-minute scanner that pushes alerts
+tests/                    pytest suite (317 tests, all offline)
 ```
 
 ## Tests
@@ -182,10 +278,17 @@ unfillable contract to a candidate.
 
 - **No market-holiday calendar.** On a holiday the phase reads REGULAR while data
   simply stays stale; the "as of" caption reveals it.
-- **Option forward-tests are resolved from snapshots, not a continuous path.** There
-  are no forward bars for a contract, only the mid each scan happens to observe, so a
-  level touched and retraced between scans is missed. Checking the stop first keeps the
-  bias conservative, but the win rate is measured with a real gap.
+- **Option data is 15-minute delayed and unquoted** on the Starter plan. Entries are
+  the last traded price, not a mid, and cost is estimated. Option bars are trade-based,
+  so an illiquid contract can sit untouched in the bars while its quote moves; such a
+  trade resolves late rather than wrongly. When bars cannot be fetched the resolver
+  falls back to the scan's snapshot price, which misses levels touched between scans.
+- **IV rank is blank for a new install's first 10 sessions**, until there are enough
+  daily readings to rank against. It is not backfilled: the Starter plan has no
+  historical IV.
+- **The per-ticker contract cap keeps the contracts nearest the money**, from strikes
+  within 25% of the underlying. Raise *Max contracts per ticker* to reach further-out
+  strikes and expiries.
 - **Yahoo has no bid/ask**, so intraday transaction cost is *estimated* from liquidity
   tiers unless a Polygon quote is available; Yahoo intraday data can lag 1–2 minutes.
 - **Forward-tested fills are optimistic in one direction:** a bar that trades through
