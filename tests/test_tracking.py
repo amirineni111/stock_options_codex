@@ -240,6 +240,15 @@ class TestOptionsResolution:
         assert resolved == 1
         assert storage.load_outcomes("options").iloc[0]["exit_reason"] == "EXPIRY"
 
+    def test_an_open_contract_keeps_its_latest_mid(self, storage):
+        """The dashboard's current price for an open option is the last mid seen."""
+        self._arm_option(storage)
+        assert storage.load_tracked("options").iloc[0]["last_price"] == pytest.approx(4.00)
+        storage.resolve_options_signals({"O:AAPL_C125": 4.20}, today=date(2026, 8, 20), now=NOW)
+        row = storage.load_tracked("options").iloc[0]
+        assert row["last_price"] == pytest.approx(4.20)
+        assert row["last_price_at"] == NOW.isoformat()
+
     def test_a_missing_quote_leaves_the_trade_open(self, storage):
         """A contract we could not price is unresolved, not a loss."""
         self._arm_option(storage)
@@ -250,6 +259,22 @@ class TestOptionsResolution:
         storage.resolve_options_signals({"O:AAPL_C125": 7.50}, today=date(2026, 8, 20), now=NOW)
         outcome = storage.load_outcomes("options").iloc[0]
         assert outcome["cost_dollars"] == pytest.approx(0.20)  # 5% of a $4 premium
+
+
+class TestCurrentPrice:
+    def test_an_open_stock_trade_keeps_the_latest_close(self, storage):
+        _arm(storage)
+        bars = _bars([(99.0, 100.0), (100.5, 101.5)])
+        storage.resolve_intraday_signals("AAPL", bars, now=NOW)
+        row = storage.load_tracked("intraday", status="open").iloc[0]
+        assert row["last_price"] == pytest.approx(101.0)
+        assert row["last_price_at"] == bars[-1]["timestamp"]
+
+    def test_alerts_carry_the_current_price(self, storage):
+        tracking_id = _arm(storage)
+        storage.claim_alert("signal", "intraday", tracking_id, "t", "b", "test", None)
+        storage.resolve_intraday_signals("AAPL", _bars([(99.0, 100.0)]), now=NOW)
+        assert storage.load_alerts().iloc[0]["last_price"] == pytest.approx(99.5)
 
 
 class TestPerformanceAndTraining:

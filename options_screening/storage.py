@@ -127,6 +127,11 @@ TRACKING_EXTRA_COLUMNS = {
     "underlying_price": "REAL",
     "underlying_stop": "REAL",
     "underlying_target": "REAL",
+    # The latest price each resolver pass saw for a still-open trade, in the same
+    # units as entry/stop/target (the stock for intraday, the contract mid for
+    # options), so the dashboard can show where an open call stands right now.
+    "last_price": "REAL",
+    "last_price_at": "TEXT",
 }
 
 # Columns stored as 0/1 rather than as SQLite booleans.
@@ -777,8 +782,9 @@ class Storage:
                     stop_price, target_price, stop_dollars, target_dollars, atr14,
                     entry_ts, expiration_date, features_json, feature_version,
                     model_prob, required_prob, model_mode, cost_pct, cost_ratio,
-                    total_score, underlying_price, underlying_stop, underlying_target
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    total_score, underlying_price, underlying_stop, underlying_target,
+                    last_price, last_price_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     lane, ticker, contract_ticker, signal, direction, entry,
@@ -787,6 +793,7 @@ class Storage:
                     json.dumps(features) if features else None, feature_version,
                     model_prob, required_prob, model_mode, cost_pct, cost_ratio,
                     total_score, underlying_price, underlying_stop, underlying_target,
+                    entry, entry_ts,
                 ),
             )
             return cursor.lastrowid
@@ -859,6 +866,8 @@ class Storage:
                     exit_ts = forward[-1].get("timestamp")
                     exit_reason = "TIMEOUT"
                 else:
+                    if forward:
+                        self._mark_tracked(row["id"], forward[-1].get("close"), forward[-1].get("timestamp"))
                     continue  # still live
 
             self._close_tracked(row, "intraday", exit_price, exit_ts, exit_reason, outcome)
@@ -911,6 +920,7 @@ class Storage:
             target = row.get("target_price") or 0.0
             exit_price = outcome = exit_reason = None
             exit_ts = now.isoformat()
+            mark_ts = exit_ts if mid is not None else None
 
             if contract in bars:
                 entered = parse_ts(row.get("entry_ts") or row.get("created_at"))
@@ -932,6 +942,7 @@ class Storage:
                         break
                 if mid is None and forward:
                     mid = forward[-1].get("close")
+                    mark_ts = forward[-1].get("timestamp") or exit_ts
             elif mid is not None:
                 # A long option: premium falling to the stop is the loss, rising to
                 # the target is the win. Direction is already baked into the bracket.
@@ -952,6 +963,8 @@ class Storage:
                     exit_price = mid
                     exit_reason = "EXPIRY" if expiring else "TIMEOUT"
                 else:
+                    if mid is not None:
+                        self._mark_tracked(row["id"], mid, mark_ts)
                     continue
 
             self._close_tracked(row, "options", exit_price, exit_ts, exit_reason, outcome)
@@ -960,6 +973,16 @@ class Storage:
         if resolved:
             self.compute_and_save_performance("options")
         return resolved
+
+    def _mark_tracked(self, tracking_id: int, price: Optional[float], ts: Optional[str]) -> None:
+        """Record the latest price seen for an open trade."""
+        if price is None:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE signal_tracking SET last_price=?, last_price_at=? WHERE id=?",
+                (price, ts, tracking_id),
+            )
 
     def _close_tracked(
         self,
@@ -1196,7 +1219,7 @@ class Storage:
         """
         sql = (
             "SELECT a.*, t.status AS trade_status, t.entry_price, t.stop_price, "
-            "       t.target_price, o.outcome, o.exit_reason, o.exit_price, "
+            "       t.target_price, t.last_price, t.last_price_at, o.outcome, o.exit_reason, o.exit_price, "
             "       o.r_multiple, o.exit_ts "
             "FROM alerts a "
             "LEFT JOIN signal_tracking t ON t.id = a.tracking_id "

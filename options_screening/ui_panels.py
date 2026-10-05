@@ -180,15 +180,31 @@ def _render_open_positions(open_rows: pd.DataFrame) -> None:
     if open_rows.empty:
         return
     with st.expander(f"Open forward tests ({len(open_rows)})"):
+        st.caption(
+            "Current price is the latest one the scans saw (the stock for intraday, "
+            "the contract mid for options), so it is only as fresh as the last scan."
+        )
+        view = open_rows.copy()
+        if "last_price_at" in view.columns:
+            view["last_price_at"] = view["last_price_at"].apply(_eastern_or_blank)
         columns = [
             c
             for c in (
-                "ticker", "contract_ticker", "signal", "entry_price", "stop_price",
-                "target_price", "model_prob", "required_prob", "created_at",
+                "ticker", "contract_ticker", "signal", "entry_price", "last_price",
+                "last_price_at", "stop_price", "target_price", "model_prob",
+                "required_prob", "created_at",
             )
-            if c in open_rows.columns
+            if c in view.columns
         ]
-        st.dataframe(open_rows[columns], use_container_width=True, hide_index=True)
+        st.dataframe(
+            view[columns],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "last_price": st.column_config.NumberColumn("current_price", format="%.2f"),
+                "last_price_at": st.column_config.Column("price_as_of"),
+            },
+        )
 
 
 # ── Alerts ───────────────────────────────────────────────────────────────────
@@ -233,11 +249,17 @@ def render_alerts_tab(storage, lane: str) -> None:
         )
 
     records = alerts.to_dict("records")
+    # A closed trade's last mark is just the price before it resolved, not a current
+    # one, so only open trades show it.
+    is_open = alerts["trade_status"] == "open"
     view = pd.DataFrame({
         "time": alerts["created_at"].apply(_eastern),
         "kind": alerts["kind"],
         "alert": alerts["title"],
         "status": [_alert_status(row) for row in records],
+        "entry": alerts["entry_price"],
+        "current": alerts["last_price"].where(is_open),
+        "as_of": alerts["last_price_at"].where(is_open).apply(_eastern_or_blank),
         "r_multiple": alerts["r_multiple"],
         "pushed": [_pushed(row) for row in records],
         "detail": alerts["body"],
@@ -249,6 +271,12 @@ def render_alerts_tab(storage, lane: str) -> None:
         column_config={
             "status": st.column_config.Column(
                 help="OPEN until the trade resolves; then SUCCESS (target first), FAILED (stop first) or EXPIRED."
+            ),
+            "entry": st.column_config.NumberColumn("entry", format="%.2f"),
+            "current": st.column_config.NumberColumn(
+                "current",
+                format="%.2f",
+                help="Latest price the scans saw for an open trade: the stock for intraday, the contract mid for options.",
             ),
             "r_multiple": st.column_config.NumberColumn("R", format="%+.2f"),
         },
@@ -267,6 +295,10 @@ def _pushed(row: Dict[str, Any]) -> str:
     if row.get("delivered"):
         return f"yes ({row.get('channel')})"
     return "no URL" if not row.get("channel") else "pending"
+
+
+def _eastern_or_blank(value) -> str:
+    return "" if value is None or pd.isna(value) else _eastern(value)
 
 
 def _eastern(value) -> str:
