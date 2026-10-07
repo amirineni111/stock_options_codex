@@ -276,8 +276,9 @@ unfillable contract to a candidate.
 
 ## Known limitations
 
-- **No market-holiday calendar.** On a holiday the phase reads REGULAR while data
-  simply stays stale; the "as of" caption reveals it.
+- **Unscheduled closures are not known.** NYSE holidays and 13:00 early closes are
+  computed, so nothing scans on them, but a one-off closure (a national day of
+  mourning, weather) reads as a normal session and scans stale data.
 - **Option data is 15-minute delayed and unquoted** on the Starter plan. Entries are
   the last traded price, not a mid, and cost is estimated. Option bars are trade-based,
   so an illiquid contract can sit untouched in the bars while its quote moves; such a

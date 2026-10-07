@@ -15,25 +15,17 @@ package rather than the script so the schedule and the settings mapping are test
 from __future__ import annotations
 
 import json
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .intraday import IntradayScanRequest
-from .market_hours import US_EASTERN
+from .market_hours import US_EASTERN, in_scan_window  # noqa: F401 (re-exported for the script)
 from .scanner import ScanRequest
 from .universe import load_sp100_tickers, load_sp500_tickers, normalize_symbol
 
 PREFERENCES_PATH = Path(__file__).resolve().parent.parent / "data" / "app_preferences.json"
 STEP_MINUTES = 15
-
-# Scan windows, Eastern time. The options lane starts and ends 15 minutes late: the
-# data is 15-minute delayed, so 09:30's scan would price the pre-open and the session's
-# last quarter-hour is only visible at 16:15.
-_WINDOWS = {
-    "options": (time(9, 45), time(16, 20)),
-    "intraday": (time(9, 30), time(16, 0)),
-}
 
 
 def next_wake(now: datetime, lag_seconds: float, step_minutes: int = STEP_MINUTES) -> datetime:
@@ -44,15 +36,6 @@ def next_wake(now: datetime, lag_seconds: float, step_minutes: int = STEP_MINUTE
     while wake <= now:
         wake += timedelta(minutes=step_minutes)
     return wake
-
-
-def in_scan_window(now: datetime, lane: str) -> bool:
-    """Whether ``lane`` has fresh data to scan at ``now``. No holiday calendar."""
-    local = now.astimezone(US_EASTERN)
-    if local.weekday() >= 5:
-        return False
-    start, end = _WINDOWS[lane]
-    return start <= local.time() <= end
 
 
 def load_preferences(path: Path = PREFERENCES_PATH) -> Dict[str, Any]:

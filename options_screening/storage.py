@@ -561,6 +561,17 @@ class Storage:
     def load_latest_rejections(self) -> pd.DataFrame:
         return self._read_latest("rejected_contracts", "ORDER BY underlying, contract_ticker")
 
+    def last_scan_at(self, lane: str) -> Optional[datetime]:
+        """When the latest ``lane`` scan started, whether the dashboard or the runner ran it."""
+        query = (
+            "SELECT started_at FROM scan_runs ORDER BY id DESC LIMIT 1"
+            if lane == "options"
+            else "SELECT MAX(created_at) FROM intraday_scan_logs"
+        )
+        with self._connect() as conn:
+            row = conn.execute(query).fetchone()
+        return parse_ts(row[0]) if row else None
+
     def load_scan_logs(self) -> pd.DataFrame:
         with self._connect() as conn:
             return pd.read_sql_query(

@@ -32,3 +32,19 @@ def test_storage_round_trip(tmp_path):
 
     assert len(frame) == 1
     assert frame.iloc[0]["underlying"] == "AAPL"
+
+
+def test_last_scan_at_reads_each_lane(tmp_path):
+    from options_screening.timeutil import utc_now
+
+    storage = Storage(tmp_path / "screen.sqlite3")
+    storage.initialize()
+    assert storage.last_scan_at("options") is None
+    assert storage.last_scan_at("intraday") is None
+
+    storage.start_scan(ScanRequest(tickers=["AAPL"]).model_dump())
+    assert abs((utc_now() - storage.last_scan_at("options")).total_seconds()) < 60
+
+    stamp = utc_now() - timedelta(minutes=5)
+    storage.save_intraday_scan([], [{"ticker": "AAPL", "created_at": stamp.isoformat()}])
+    assert storage.last_scan_at("intraday") == stamp

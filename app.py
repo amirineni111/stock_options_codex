@@ -12,10 +12,16 @@ from options_screening.config import get_settings
 from options_screening.intraday import IntradayScanRequest, run_intraday_scan
 from options_screening.market_hours import (
     current_market_phase,
-    is_regular_market_hours,
+    in_scan_window,
+    next_scan_window_start,
     phase_badge_color,
 )
-from options_screening.refresh import format_refresh_interval, refresh_interval_to_ms
+from options_screening.refresh import (
+    format_refresh_interval,
+    refresh_interval_to_ms,
+    scan_is_stale,
+    sleep_interval_ms,
+)
 from options_screening.scanner import ScanRequest, run_scan
 from options_screening.storage import Storage
 from options_screening.ui_panels import (
@@ -240,6 +246,25 @@ def _deliver_alerts(storage: Storage, settings) -> None:
         st.toast(message.title, icon="🔔")
     if report.errors:
         st.warning("Alert push failed: " + "; ".join(report.errors))
+
+
+def _auto_refresh_timer_ms(now: datetime, lane: str, window_open: bool, interval_ms: int) -> int:
+    """
+    The auto-refresh timer's delay: the chosen interval while the lane's scan window is
+    open, otherwise one long sleep to just after it reopens.
+
+    A closed-market tick would scan nothing, so rather than rerunning the page every
+    interval overnight and through weekends and holidays, the timer fires once, when
+    there is data again.
+    """
+    if window_open:
+        return interval_ms
+    resume_at = next_scan_window_start(now, lane)
+    st.info(
+        f"Market closed. Auto-refresh is paused until {resume_at:%a %b %d, %H:%M} ET; "
+        "no data is fetched until then. Run a scan manually if you need one."
+    )
+    return sleep_interval_ms(now, resume_at)
 
 
 def _render_metric_row(df: pd.DataFrame) -> None:
@@ -651,20 +676,27 @@ def _render_intraday_page(settings, storage: Storage, preferences: dict) -> None
             f"Refresh every {int(intraday_refresh_interval)} min."
         )
 
+    intraday_refresh_ms = int(intraday_refresh_interval) * 60 * 1000
+    now = datetime.now(EASTERN_TZ)
+    window_open = in_scan_window(now, "intraday")
     auto_count = None
     if st.session_state.intraday_auto_refresh:
-        auto_count = st_autorefresh(interval=int(intraday_refresh_interval) * 60 * 1000, key="intraday_auto_refresh_counter")
-        if not is_regular_market_hours():
-            st.info("Intraday auto-refresh is enabled and waiting for regular US market hours.")
+        auto_count = st_autorefresh(
+            interval=_auto_refresh_timer_ms(now, "intraday", window_open, intraday_refresh_ms),
+            key="intraday_auto_refresh_counter",
+        )
 
     # The tick-counter comparison is the idempotence guard: Streamlit reruns on any
     # widget interaction, so without it every filter click would fire a fresh scan.
+    new_tick = auto_count is not None and auto_count != st.session_state.intraday_last_auto_refresh_count
+    if new_tick:
+        st.session_state.intraday_last_auto_refresh_count = auto_count
     auto_due = (
-        st.session_state.intraday_auto_refresh
+        new_tick
+        and st.session_state.intraday_auto_refresh
         and bool(selected_tickers)
-        and is_regular_market_hours()
-        and auto_count is not None
-        and auto_count != st.session_state.intraday_last_auto_refresh_count
+        and window_open
+        and scan_is_stale(storage.last_scan_at("intraday"), now, intraday_refresh_ms)
     )
 
     if run_now or auto_due:
@@ -675,8 +707,6 @@ def _render_intraday_page(settings, storage: Storage, preferences: dict) -> None
             storage.save_intraday_scan(results, logs)
         _deliver_alerts(storage, settings)
         st.session_state.intraday_last_scan_at = datetime.now(EASTERN_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
-        if auto_due:
-            st.session_state.intraday_last_auto_refresh_count = auto_count
         st.success(
             f"Intraday scan complete: {summary.accepted} candidates, {summary.watch} watch, "
             f"{summary.avoid} avoid, {summary.errors} errors."
@@ -1093,23 +1123,29 @@ def main() -> None:
         universe_label = "custom list" if ticker_source == "Custom" else "S&P 500"
         st.write(f"Universe: {universe_label}, {len(selected_tickers)} tickers. Refresh target: {refresh_label} during market hours.")
 
+    now = datetime.now(EASTERN_TZ)
+    window_open = in_scan_window(now, "options")
     auto_count = None
     if st.session_state.auto_refresh:
         auto_refresh_key = f"auto_refresh_counter_{refresh_interval_ms}"
         if st.session_state.last_auto_refresh_key != auto_refresh_key:
             st.session_state.last_auto_refresh_count = None
             st.session_state.last_auto_refresh_key = auto_refresh_key
-        auto_count = st_autorefresh(interval=refresh_interval_ms, key=auto_refresh_key)
-        if not is_regular_market_hours():
-            st.info(f"Auto-refresh is enabled every {refresh_label} and waiting for regular US market hours.")
+        auto_count = st_autorefresh(
+            interval=_auto_refresh_timer_ms(now, "options", window_open, refresh_interval_ms),
+            key=auto_refresh_key,
+        )
 
+    new_tick = auto_count is not None and auto_count != st.session_state.last_auto_refresh_count
+    if new_tick:
+        st.session_state.last_auto_refresh_count = auto_count
     auto_due = (
-        st.session_state.auto_refresh
+        new_tick
+        and st.session_state.auto_refresh
         and bool(settings.polygon_api_key)
         and bool(selected_tickers)
-        and is_regular_market_hours()
-        and auto_count is not None
-        and auto_count != st.session_state.last_auto_refresh_count
+        and window_open
+        and scan_is_stale(storage.last_scan_at("options"), now, refresh_interval_ms)
     )
 
     if run_now or auto_due:
@@ -1117,8 +1153,6 @@ def main() -> None:
             summary = run_scan(settings, storage, scan_request)
         _deliver_alerts(storage, settings)
         st.session_state.last_scan_at = datetime.now(EASTERN_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
-        if auto_due:
-            st.session_state.last_auto_refresh_count = auto_count
         scan_message = (
             f"Scan complete: {summary.accepted} accepted, {summary.rejected} rejected, "
             f"{summary.errors} errors; {summary.armed} new signals tracked, "
